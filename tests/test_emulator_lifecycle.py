@@ -851,15 +851,24 @@ class MainRoundLifecycleTests(unittest.TestCase):
         unlock.assert_not_called()
 
     def test_mature_immediate_retry_does_not_shutdown_emulator(self):
-        patches = list(self.common_main_patches())
-        patches[3] = patch.object(
-            app,
-            "report_device_state",
-            side_effect=[None, self.StopMain()],
-        )
         with ExitStack() as stack:
-            for item in patches:
+            for item in self.common_main_patches():
                 stack.enter_context(item)
+            # Override the named step without replacing the launch isolation.
+            report = stack.enter_context(
+                patch.object(
+                    app,
+                    "report_device_state",
+                    side_effect=[None, self.StopMain()],
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    app.subprocess,
+                    "run",
+                    side_effect=AssertionError("Main-loop tests must not run device commands"),
+                )
+            )
             stack.enter_context(
                 patch.object(app, "ensure_emulator_running", return_value=True)
             )
@@ -875,6 +884,7 @@ class MainRoundLifecycleTests(unittest.TestCase):
             with self.assertRaises(self.StopMain):
                 app.main()
 
+        self.assertEqual(report.call_count, 2)
         shutdown.assert_not_called()
         wait.assert_not_called()
         unlock.assert_not_called()
