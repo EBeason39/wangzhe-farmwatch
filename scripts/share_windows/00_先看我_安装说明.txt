@@ -1,0 +1,25 @@
+FarmWatch · 王者农场自动化助手
+
+完成第一次准备后，日常只需要：
+  双击 start_background.bat 启动后台务农。
+  双击 stop_background.bat 停止后台务农。
+
+第一次准备：
+1. 安装 Python 3.12 x64 和 MuMu；准备唯一名为 farm 的实例，设为 1280×720 横屏。
+2. 在模拟器内安装王者荣耀，手动完成首次登录，并确认能进入农场。
+3. 完整解压本包到可写目录，不要直接在 ZIP 中运行，建议避免中文目录。
+4. 按需修改 settings.ini。修改后停止并重新启动才能生效。
+5. 双击 start_background.bat。首次会自动创建环境并安装依赖，需要联网。
+
+关闭或修改功能：
+  [friends] enabled=false：关闭好友访问，仅管理自己的农场。
+  [notify] enabled=false：关闭消息推送。
+  [screenshots] enabled=false：关闭历史截图归档，仍保留必要的当前工作截图。
+  [updates] enabled=false：跳过自动更新检测，需自行处理游戏更新。
+请修改已有配置项，不要重复添加同名分组。详细示例见 README.md。
+
+01_install.bat、02_check_mumu.bat、03_start.bat 是可选辅助入口，
+日常无需依次运行。正常日志在 logs/farmwatch.log。
+关闭启动时的命令窗口不会停止后台任务；停止请双击 stop_background.bat。
+
+MIT 许可证见 LICENSE。实际 settings.ini、data/、logs/、tmp/ 和 Python 环境仅供本机使用。

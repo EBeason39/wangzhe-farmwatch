@@ -1,0 +1,121 @@
+{
+  "resolution": [
+    1280,
+    720
+  ],
+  "assets": {
+    "session-start.png": {
+      "source": "live-capture",
+      "captured_at": "2026-11-11T15:28:12.934180+08:00",
+      "frame_sha256": "6075405fa71f2bf42ec4248622d5550c45e57ad0c1de0d9f94d9dd402a5e2934",
+      "crop": [
+        566,
+        536,
+        715,
+        581
+      ],
+      "sha256": "8f68b4d3faa4e7c456479dcba1432fbd830afdd2bbffd49cb82f27503ca00dca"
+    },
+    "dialog-dismiss.png": {
+      "source": "live-capture",
+      "captured_at": "2026-11-11T15:29:51.351816+08:00",
+      "frame_sha256": "fd9e4aafeea1afee8c14d10775ff888e81259415e07e73a6f5de1febd8794dad",
+      "crop": [
+        1170,
+        82,
+        1207,
+        117
+      ],
+      "sha256": "8eb6632d165e72c00b4aa0f8b86c8c73ad022e27017615e2cbd08f6836259f07"
+    },
+    "farm-enter.png": {
+      "source": "live-capture",
+      "captured_at": "2026-11-11T15:31:28.867641+08:00",
+      "frame_sha256": "324acf51376a85b1d27445b5186b03eca3bb6a0ee0bd6cf34a9013fd6194ab22",
+      "crop": [
+        261,
+        529,
+        380,
+        554
+      ],
+      "sha256": "554c84c6e2eadd4548b40b9aa2d5ad02da4ba1f31c829d2d4960cb1a09c169f1"
+    },
+    "farm-reset.png": {
+      "source": "live-capture",
+      "captured_at": "2026-11-11T15:32:13.864529+08:00",
+      "frame_sha256": "e2d13ff9797b401ae53cb721f336c79239a947024a0ffa19e214342bdfac2fb5",
+      "crop": [
+        1168,
+        638,
+        1203,
+        670
+      ],
+      "sha256": "688d65f9f024742df1b88c9d3d8af90b5d869036767b0de84e9e1ca9156ab680"
+    },
+    "farm-action.png": {
+      "source": "live-capture",
+      "captured_at": "2026-11-11T15:32:22.659733+08:00",
+      "frame_sha256": "9f99da55f68f247a6e2d416e86a5a051312a0023e40eef0bfe290734dfe8a017",
+      "crop": [
+        813,
+        375,
+        895,
+        463
+      ],
+      "sha256": "c437c7df2cceeeec36adb73d297e350717e06a49c76b325339a953ad3cfc4398"
+    },
+    "social-collapse.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "742d397f2c99a07981fddd96eec659956354d757cce26e22238c512b65f3e5d3",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-game-tab.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "76d92b125a8debe825f3f9ec46409e4f9664925d5fe6ff6579126b3fc1884ed5",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-home.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "fb9528a73e1af11c9791a0ad4ece58bac27e19ce14b5052d10095c0ec78756d0",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-open.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "6ffcaf3077573c85d42dbeda9426abee73c8fd41970e86ec02d260ae72f372c1",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-ready.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "3cbd587fa18f3679bc129a9a2e3093b787d6135689dcf448073b1bd37a16f14b",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-take-dim.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "346dec9fc41fc015661620794426fd93399f09248146b67bdebf71e545526276",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-take-lit.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "6ca4c6e966613a7aefdd13e171b9bba4f11ed76e659f76332b02876a97956299",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "social-visit.png": {
+      "source": "local-friend-feature-capture",
+      "sha256": "d1b79a22d1804a889cfac049a101d6c46d9723aa1cf68d96d960f925d894bda8",
+      "note": "本机好友功能实测采集资源，使用 1280×720 画面。"
+    },
+    "account-qq-android.png": {
+      "source": "live-login-failure-capture",
+      "captured_at": "2026-11-11T16:45:51.457527+08:00",
+      "frame_sha256": "cd4c7c54e520e838c30368be41ae5d83bac0326925722fbf821083aaaefe37b9",
+      "crop": [
+        957,
+        545,
+        997,
+        588
+      ],
+      "sha256": "935576ca50afa3cced657b7e822ad5a6c96867c03c38f11dcbcbf97c13fe996b",
+      "note": "QQ 安卓登录按钮；避开适龄提示覆盖的文字区域。"
+    }
+  }
+}
