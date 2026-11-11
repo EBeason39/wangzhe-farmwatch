@@ -1,0 +1,34 @@
+# Runtime and personal data
+/data/
+/logs/
+/tmp/
+/dist/
+/settings.ini
+/settings.ini.pending
+/venv/
+/venv_*/
+/.venv/
+/runtime/
+/platform-tools/
+/AGENTS.md
+/AGENTS.local.md
+/.env
+/.env.*
+/.python-version
+/.coverage
+/htmlcov/
+/coverage.xml
+/*.egg-info/
+/build/
+/notify_config.json
+/release-info.json
+/*.zip
+
+# Local tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.vscode/
+.idea/
+.agents/
