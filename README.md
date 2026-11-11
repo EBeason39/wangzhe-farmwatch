@@ -22,11 +22,10 @@
 - **按实际作物安排浇水**：识别作物名称与剩余成熟时间，保存周期记录，计算后续浇水和收获时间。
 - **等待期间释放模拟器资源**：自动管理模式下，处理完本轮后退出游戏并关闭 MuMu，临近下一次操作再启动模拟器。提前启动完成后仍会等到目标时刻再务农。
 - **置顶好友访问**：可选访问置顶且可拿取的好友，按照 24 地块路线确认状态；自家农场计划优先。北京时间 00:00–08:00 不执行好友拿取。
-- **QQ 登录恢复**：支持已具备 QQ 授权条件时的隐私协议、安卓 QQ 入口和授权确认流程。QQ 入口通过图标定位，避免“12+”提示遮挡按钮文字造成漏检。
+- **QQ 登录恢复**：在账号具备 QQ 登录条件时，自动完成登录确认和授权步骤，随后继续进入游戏。首次使用仍需手动登录账号。
 - **双通道推送**：支持 WxPusher 和 Server酱，可自行选择通道；未填写凭据时跳过推送，不影响务农。
 - **按需保存截图**：默认只维护识别需要的当前画面。需要排错时，可开启关键节点或全部截图归档，并设置保留时间。
-- **固定画布识别**：仅维护 1280×720 的控件和路线，复用图片、模板和同帧识别结果。其他分辨率不会作为受支持的自动点击画布。
-- **可维护的模块结构**：设备控制、业务流程、识别、作物规划、推送和进程管理分开组织，提供隔离测试及 Windows CI。
+- **统一运行环境**：支持 MuMu 模拟器 1280×720 横屏，请在开始使用前按此要求设置分辨率。
 
 ## 第一次使用：准备环境
 
@@ -216,7 +215,7 @@ retention_days = 14
 | 找不到 MuMu CLI / ADB | 在 `[mumu] cli`、`adb` 中填写真实存在的 `.exe` 绝对路径 |
 | 提示分辨率不支持 | 把 MuMu 实例设为 1280×720 横屏后重启 |
 | 第一次启动比较慢 | 首次会创建环境和下载依赖；查看窗口信息，等待安装完成 |
-| 启动窗口关闭后不知道有没有运行 | 查看 `logs/farmwatch.log`；需要命令行状态时见下方可选命令 |
+| 启动窗口关闭后不知道有没有运行 | 查看 `logs/farmwatch.log`；需要观察运行过程时，先停止后台，再使用 `start.bat` |
 | 修改配置没有效果 | 确认改的是 `settings.ini`，停止后再启动；环境变量的优先级高于文件 |
 | 没收到消息 | 检查推送开关、通道、对应凭据和每日次数；日志会记录推送情况 |
 | 游戏要求验证码或额外手动验证 | 先停止脚本，在模拟器中完成验证，再重新启动 |
@@ -224,57 +223,12 @@ retention_days = 14
 
 正常日志是 `logs/farmwatch.log`，后台初始化错误可能位于 `logs/farmwatch_bootstrap_*.log`。共享日志或截图前，请检查其中是否包含账号信息。
 
-## 开发者可选命令
+## 更多说明
 
-普通使用不需要运行本节命令。
-
-```bat
-venv\Scripts\python.exe -m farmwatch status
-venv\Scripts\python.exe -m farmwatch check
-venv\Scripts\python.exe -m farmwatch selftest
-venv\Scripts\python.exe -m farmwatch run --once
-```
-
-- `status`：查询后台状态。
-- `check`：检查已启动实例的 ADB、游戏安装和分辨率，不自动打开模拟器。
-- `selftest`：检查资源、路线和 OCR，不连接设备、不发送消息。
-- `run --once`：前台执行一轮，结束后退出。
-
-开发环境和测试：
-
-```bat
-python -m venv venv
-venv\Scripts\python.exe -m pip install -r requirements-dev.txt
-venv\Scripts\python.exe -m pytest -q
-venv\Scripts\python.exe scripts\verify_release.py
-```
-
-构建 Windows 包使用 `scripts/package.py`；构建源码包使用 `scripts/package.py --source`。输出位于 `dist/`。`verify_release.py` 还会独立解压、自检并验证源码包可以重新构建两种发行包。
-
-## 哪些文件放仓库，哪些留在本机
-
-| 内容 | 放入 Git 仓库 | 用途 |
-| --- | --- | --- |
-| `farmwatch/` | 是 | 项目代码，包含其中的 `farmwatch/runtime/` 模块 |
-| `resources/` | 是 | 1280×720 识别资源、来源清单和好友路线 |
-| `scripts/`、三个根目录 `.bat` | 是 | 启动、安装准备、打包与验证脚本 |
-| `tests/` | 是 | 测试代码、去除账号信息后的测试图片 |
-| `docs/`、`README.md`、`CHANGELOG.md` | 是 | 使用、开发和版本说明 |
-| `LICENSE` | 是 | MIT 许可证 |
-| `requirements.txt`、`requirements-dev.txt`、`pyproject.toml` | 是 | 运行依赖、开发依赖和测试配置 |
-| `settings.example.ini` | 是 | 不含私人凭据的配置示例 |
-| `.github/`、`.gitignore`、`.gitattributes` | 是 | CI、忽略规则和换行规则 |
-| `settings.ini`、`.env` | **否** | 本机实例设置及私人推送凭据 |
-| `data/` | **否** | 作物周期、好友状态、当前运行截图 |
-| `logs/`、`tmp/` | **否** | 日志、PID、诊断截图、临时工作文件 |
-| 根目录 `runtime/`、`venv/`、`.venv/`、`platform-tools/` | **否** | 本机 Python、虚拟环境和工具安装文件 |
-| `dist/` | **否** | 构建产物；需要分享时作为 Release 附件 |
-| `AGENTS.md`、`.agents/`、编辑器与缓存目录 | **否** | 本机工作区说明和开发工具状态 |
-
-上面的“否”项由 `.gitignore` 排除。**根目录的 `runtime/` 是本地环境；`farmwatch/runtime/` 是项目代码，必须提交。** 完整分类、首发检查和提交清单见 [仓库与本地文件说明](docs/repository.md)。
+功能配置详见 [配置指南](docs/configuration.md)。需要了解仓库文件、本机配置和备份范围，请查看 [文件分类说明](docs/repository.md)。
 
 ## 许可证
 
 项目使用 **MIT License**，许可证全文见 [LICENSE](LICENSE)。第三方依赖、游戏图像及商标保留各自的权利与许可。
 
-[配置指南](docs/configuration.md) · [开发指南](docs/architecture.md) · [验证记录](docs/validation.md) · [更新记录](CHANGELOG.md)
+[配置指南](docs/configuration.md) · [文件分类](docs/repository.md) · [更新记录](CHANGELOG.md)
