@@ -1,4 +1,4 @@
-<p align="center"><img src="docs/brandmark.svg" alt="FarmWatch · 王者农场自动化" width="100%"></p>
+<p align="center"><img src="resources/branding/brandmark.svg" alt="FarmWatch · 王者农场自动化" width="100%"></p>
 
 # FarmWatch · 王者农场自动化助手
 
@@ -204,7 +204,7 @@ retention_days = 14
 
 排错时可把 `level` 改为 `DEBUG`。支持 `DEBUG`、`INFO`、`WARNING`、`ERROR`；日志保留天数必须是大于等于 1 的整数。
 
-自动务农、收获处理、作物识别和浇水规划属于主流程，目前没有分别关闭的配置项。停止整个自动流程请使用 `stop_background.bat`。全部配置及环境变量说明见 [配置指南](docs/configuration.md)。
+自动务农、收获处理、作物识别和浇水规划属于主流程，目前没有分别关闭的配置项。停止整个自动流程请使用 `stop_background.bat`。其他选项可参考根目录 `settings.example.ini` 中的注释。
 
 ## 日志与常见问题
 
@@ -223,12 +223,8 @@ retention_days = 14
 
 正常日志是 `logs/farmwatch.log`，后台初始化错误可能位于 `logs/farmwatch_bootstrap_*.log`。共享日志或截图前，请检查其中是否包含账号信息。
 
-## 更多说明
-
-功能配置详见 [配置指南](docs/configuration.md)。需要了解仓库文件、本机配置和备份范围，请查看 [文件分类说明](docs/repository.md)。
-
 ## 许可证
 
 项目使用 **MIT License**，许可证全文见 [LICENSE](LICENSE)。第三方依赖、游戏图像及商标保留各自的权利与许可。
 
-[配置指南](docs/configuration.md) · [文件分类](docs/repository.md) · [更新记录](CHANGELOG.md)
+[更新记录](CHANGELOG.md)

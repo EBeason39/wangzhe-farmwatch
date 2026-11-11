@@ -19,16 +19,15 @@ def payload(*, source=False):
     files = {name: ROOT/name for name in (
         'README.md', 'CHANGELOG.md', 'LICENSE', 'requirements.txt', 'settings.example.ini',
         'start.bat', 'start_background.bat', 'stop_background.bat',
-        'scripts/bootstrap.bat', 'resources/routes/pinned-friends.json',
+        'scripts/bootstrap.bat', 'resources/branding/brandmark.svg',
+        'resources/routes/pinned-friends.json',
         'resources/ui/1280x720/capture-manifest.json',
     )}
     # Source checkouts generate their own private configuration on first start.
     if not source:
         files['settings.ini'] = ROOT/'settings.example.ini'
-    for directory, patterns in [('farmwatch', ('*.py',)), ('docs', ('*.md','*.svg'))]:
-        for pattern in patterns:
-            for path in sorted((ROOT/directory).rglob(pattern)):
-                files[path.relative_to(ROOT).as_posix()] = path
+    for path in sorted((ROOT/'farmwatch').rglob('*.py')):
+        files[path.relative_to(ROOT).as_posix()] = path
     for name in required_assets():
         relative=f'resources/ui/1280x720/{name}'
         files[relative]=ROOT/relative

@@ -24,6 +24,9 @@
 /release-info.json
 /*.zip
 
+# Local project notes
+/docs/
+
 # Local tooling
 __pycache__/
 *.py[cod]

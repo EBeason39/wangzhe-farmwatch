@@ -28,7 +28,7 @@ def inspect(path, *, source, secrets):
         names = archive.namelist()
         if archive.testzip() is not None:
             raise RuntimeError(f'Invalid archive: {path.name}')
-        forbidden = {'data','logs','tmp','venv','runtime','.git','.agents','AGENTS.md','.env'}
+        forbidden = {'data','docs','logs','tmp','venv','runtime','.git','.agents','AGENTS.md','.env'}
         for name in names:
             parts = Path(name).parts
             if len(parts) < 2 or parts[0] != 'FarmWatch' or '..' in parts or parts[1] in forbidden:
@@ -42,8 +42,10 @@ def inspect(path, *, source, secrets):
                 raise RuntimeError(f'Hash mismatch: {name}')
             if any(secret in data for secret in secrets):
                 raise RuntimeError(f'Private credential in release file: {name}')
-        if 'FarmWatch/LICENSE' not in names:
-            raise RuntimeError('LICENSE is missing')
+        required_public = {'FarmWatch/LICENSE', 'FarmWatch/README.md',
+                           'FarmWatch/resources/branding/brandmark.svg'}
+        if not required_public.issubset(names):
+            raise RuntimeError('Public usage files are missing')
         if source:
             required = {'FarmWatch/requirements-dev.txt', 'FarmWatch/scripts/package.py',
                         'FarmWatch/scripts/verify_release.py',
