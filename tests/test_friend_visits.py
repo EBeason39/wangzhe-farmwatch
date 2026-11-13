@@ -106,6 +106,10 @@ class RecognitionTests(unittest.TestCase):
             for j, b in enumerate(rows[:3]):
                 self.assertEqual(self.vision.same_friend(a, b), i == j)
 
+    def test_same_name_image_survives_an_inconsistent_ocr_reading(self):
+        friend = self.vision.friends(self.frame("social"))[0]
+        self.assertTrue(self.vision.same_friend(friend, replace(friend, name=friend.name + "x")))
+
     def test_lit_and_dim_hands_on_recorded_frames(self):
         enabled = self.vision.plot(self.frame("enabled"))
         disabled = self.vision.plot(self.frame("disabled"))
@@ -147,6 +151,28 @@ class RecognitionTests(unittest.TestCase):
                 self.assertIsNone(before.remaining)
                 self.assertIsNone(after.remaining)
 
+    def test_strong_dim_hands_on_foliage_are_not_unknown(self):
+        for name, stock in (("live_dim_foliage_mutant_a", 57),
+                            ("live_dim_foliage_mutant_b", 50),
+                            ("live_dim_foliage_orange", 79)):
+            with self.subTest(frame=name):
+                state = self.vision.plot(self.frame(name))
+                self.assertTrue(state.selected)
+                self.assertEqual(state.stock, stock)
+                self.assertIsNone(state.button)
+                self.assertTrue(state.disabled)
+
+    def test_dim_extension_requires_a_strong_shape(self):
+        image = self.frame("live_dim_foliage_orange")
+        with patch.object(cv2, "minMaxLoc", return_value=(0, .70, (0, 0), (45, 21))):
+            self.assertEqual(self.vision.take_button(image), (None, False))
+
+    def test_remaining_hand_gap_stays_uncertain(self):
+        image = self.frame("live_dim_foliage_orange")
+        with patch.object(cv2, "minMaxLoc", return_value=(0, .90, (0, 0), (45, 21))), \
+                patch.object(np, "median", side_effect=[24.0, 0.0]):
+            self.assertEqual(self.vision.take_button(image), (None, False))
+
     def test_weaker_hand_match_cannot_enable_clicking(self):
         self.assertEqual(self.vision.take_button(self.frame("live_no_hand")), (None, False))
         with patch.object(cv2, "minMaxLoc", return_value=(0, .70, (0, 0), (45, 21))):
@@ -177,6 +203,113 @@ class RunnerTests(unittest.TestCase):
         self.sleep.start()
         self.addCleanup(self.sleep.stop)
 
+    def friend(self, name="alpha", *, available=False, y=150):
+        identity = np.tile(np.arange(252, dtype=np.uint8), (36, 1))
+        return f.Friend(y, True, available, identity, name)
+
+    def scan_pages(self, pages):
+        self.runner.scan_friends = Mock(side_effect=[iter(pages) for _ in range(13)])
+        self.runner.vision.same_friend.side_effect = f.Vision.same_friend
+        self.runner.vision.friends.return_value = [friend for page in pages for friend in page]
+
+    def test_default_budget_uses_available_time_beyond_ten_minutes(self):
+        now = datetime(2026, 11, 12, 12)
+        self.host.datetime = SimpleNamespace(now=Mock(return_value=now))
+        with patch.object(f.time, "monotonic", return_value=100):
+            runner = f.Runner(self.host, now + timedelta(minutes=20))
+            limited = f.Runner(self.host, now + timedelta(minutes=20), max_seconds=600)
+        self.assertEqual(runner.deadline, 1285)
+        self.assertEqual(limited.deadline, 700)
+
+    def test_pinned_friend_without_a_ready_badge_is_still_checked(self):
+        friend = self.friend()
+        self.scan_pages([[friend]])
+        self.assertIs(self.runner.next_friend(), friend)
+
+    def test_ready_friend_on_later_page_precedes_badgeless_friend(self):
+        first = self.friend("alpha")
+        second = self.friend("bravo", available=True, y=250)
+        # Distinct name images, as in the actual list.
+        second.identity = np.flip(first.identity, axis=1).copy()
+        self.scan_pages([[first], [second]])
+        self.assertIs(self.runner.next_friend(), second)
+
+    def test_pending_friend_precedes_other_ready_friends_without_needing_a_badge(self):
+        pending = self.friend("alpha")
+        ready = self.friend("bravo", available=True)
+        ready.identity = np.flip(pending.identity, axis=1).copy()
+        self.runner.save_progress(pending, {"L1-1"})
+        self.scan_pages([[ready], [pending]])
+        self.assertIs(self.runner.next_friend(), pending)
+
+    def test_ready_badge_may_disappear_during_fresh_row_confirmation(self):
+        before = self.friend(available=True)
+        after = replace(before, available=False, y=250)
+        self.scan_pages([[before]])
+        self.runner.vision.friends.return_value = [after]
+        self.assertIs(self.runner.next_friend(), after)
+
+    def test_unstable_first_account_does_not_prevent_selecting_the_next_account(self):
+        first = self.friend("alpha", available=True)
+        second = self.friend("bravo", available=True)
+        second.identity = np.flip(first.identity, axis=1).copy()
+        self.scan_pages([[first, second]])
+        self.runner.vision.friends.return_value = [second]
+        self.assertIs(self.runner.next_friend(), second)
+
+    def test_visited_friend_and_unpinned_friend_are_not_selected_again(self):
+        friend = self.friend()
+        self.runner.visited = [friend]
+        self.scan_pages([[friend, replace(friend, pinned=False, name="other")]])
+        self.assertIsNone(self.runner.next_friend())
+
+    def test_pending_progress_survives_restart_and_rechecks_unavailable_plots(self):
+        friend = self.friend()
+        self.runner.save_progress(friend, {"L1-1", "L1-2"})
+        restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
+        restored.move = Mock()
+        restored.take_plot = Mock(return_value="unavailable")
+        restored.walk(friend)
+        visit = restored.report["visits"][0]
+        self.assertEqual([p["outcome"] for p in visit["plots"][:2]], ["already_taken"] * 2)
+        self.assertEqual(restored.take_plot.call_count, 22)
+        self.assertTrue(visit["complete"])
+        self.assertEqual(restored.limit.data["pending_visits"], [])
+
+    def test_interrupt_after_a_take_saves_progress_before_next_movement(self):
+        friend = self.friend()
+        self.runner.move = Mock(side_effect=[None, None, f.StopVisit("test deadline")])
+        self.runner.take_plot = Mock(return_value="taken")
+        with self.assertRaises(f.StopVisit):
+            self.runner.walk(friend)
+        restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
+        self.assertEqual(restored.pending_for(friend)["taken"], {"L1-1"})
+        self.assertFalse(self.runner.report["visits"][0]["complete"])
+
+    def test_saving_multiple_pending_accounts_does_not_compare_numpy_arrays(self):
+        first = self.friend("alpha")
+        second = self.friend("bravo")
+        second.identity = np.flip(first.identity, axis=1).copy()
+        self.runner.save_progress(first, {"L1-1"})
+        self.runner.save_progress(second, {"L1-2"})
+        self.runner.save_progress(second, {"L1-2", "L1-3"})
+        self.assertEqual(self.runner.pending_for(second)["taken"], {"L1-2", "L1-3"})
+        self.assertEqual(len(self.runner.pending), 2)
+
+    def test_pending_progress_does_not_survive_next_game_day(self):
+        friend = self.friend()
+        self.runner.save_progress(friend, {"L1-1"})
+        self.runner.limit.refresh(datetime.now(f.CHINA_TZ) + timedelta(days=1))
+        self.assertEqual(self.runner.load_progress("pending_visits"), [])
+
+    def test_scan_retries_an_empty_recognition_before_stopping(self):
+        friend = self.friend()
+        self.runner.open_social = Mock()
+        self.runner.vision.friends.side_effect = [[], [friend], [friend]]
+        pages = list(self.runner.scan_friends())
+        self.assertEqual(len(pages), 2)
+        self.assertIs(pages[0][0], friend)
+
     def test_success_requires_counter_change(self):
         before = f.PlotState(selected=True, remaining=39, stock=44, button=(1073, 569))
         after = f.PlotState(selected=True, remaining=38, stock=41, disabled=True)
@@ -189,6 +322,17 @@ class RunnerTests(unittest.TestCase):
         self.runner.vision.plot.return_value = f.PlotState(selected=True, feedback="unavailable", unripe=True)
         self.assertEqual(self.runner.take_plot("L1-1"), "unavailable")
         self.runner.tap.assert_not_called()
+
+    def test_live_dim_foliage_is_resolved_without_clicking_or_claiming_a_take(self):
+        self.runner.vision = f.Vision(w.TEMPLATE_DIR, w.get_ocr())
+        for name in ("live_dim_foliage_mutant_a", "live_dim_foliage_mutant_b",
+                     "live_dim_foliage_orange"):
+            with self.subTest(frame=name):
+                image = cv2.imread(str(Path(__file__).parent / "fixtures" / "friends" / (name + ".png")))
+                self.runner.capture = Mock(side_effect=[image, image])
+                self.assertEqual(self.runner.take_plot("L1-1"), "unavailable")
+                self.runner.tap.assert_not_called()
+                self.assertEqual(self.runner.capture.call_count, 2)
 
     def test_hidden_daily_counter_still_requires_a_confirmed_stock_change(self):
         self.runner.vision.plot.side_effect = [
@@ -283,13 +427,30 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["outcomes"]["taken"], 0)
         self.assertEqual(json.loads((self.host.DATA_DIR / "friend_visits_last_run.json").read_text(encoding="utf-8")), report)
 
-    def test_walk_does_not_mark_unknown_route_complete(self):
+    def test_isolated_unknown_does_not_skip_the_remaining_plots(self):
         self.runner.move = Mock()
-        self.runner.take_plot = Mock(side_effect=["unavailable", "unknown"])
+        self.runner.take_plot = Mock(side_effect=["unavailable", "unknown", "unknown"] + ["taken"] * 22)
         self.runner.walk()
         visit = self.runner.report["visits"][0]
         self.assertFalse(visit["complete"])
-        self.assertEqual(len(visit["plots"]), 2)
+        self.assertEqual(len(visit["plots"]), 24)
+        self.assertEqual(visit["plots"][-1], {"id": "R1-4", "outcome": "taken"})
+
+    def test_unknown_that_recovers_on_recheck_completes_the_route(self):
+        self.runner.move = Mock()
+        self.runner.take_plot = Mock(side_effect=["unknown"] + ["taken"] * 24)
+        self.runner.walk()
+        self.assertTrue(self.runner.report["visits"][0]["complete"])
+        self.assertEqual(self.runner.take_plot.call_count, 25)
+
+    def test_three_consecutive_unresolved_plots_stop_an_unreliable_route(self):
+        self.runner.move = Mock()
+        self.runner.take_plot = Mock(return_value="unknown")
+        self.runner.walk()
+        visit = self.runner.report["visits"][0]
+        self.assertFalse(visit["complete"])
+        self.assertEqual(len(visit["plots"]), 3)
+        self.assertEqual(self.runner.take_plot.call_count, 6)
 
     def test_walk_checks_all_distinct_plots(self):
         self.runner.move = Mock()
@@ -306,17 +467,77 @@ class RunnerTests(unittest.TestCase):
         self.runner.tap.assert_not_called()
         self.assertFalse(self.runner.limit.path.exists())
 
-    def test_selection_requires_pin_badge_and_fresh_recheck(self):
+    def test_selection_requires_pinning_and_fresh_recheck(self):
         identity = np.zeros((36, 252), np.uint8)
         friends = [f.Friend(127, True, False, identity, "a"),
                    f.Friend(233, False, True, identity, "b"),
                    f.Friend(339, True, True, identity, "c")]
-        self.runner.open_social = Mock()
-        self.runner.vision.same_friend.side_effect = lambda a, b: a.name == b.name
-        self.runner.vision.friends.side_effect = [friends, friends]
+        self.scan_pages([friends])
         self.assertEqual(self.runner.next_friend().name, "c")
-        self.runner.vision.friends.side_effect = [friends, [f.Friend(339, False, True, identity, "c")], []]
-        self.assertIsNone(self.runner.next_friend())
+        self.scan_pages([friends])
+        self.runner.vision.friends.return_value = [replace(friends[2], pinned=False)]
+        with self.assertRaisesRegex(f.StopVisit, "重新定位失败"):
+            self.runner.next_friend()
+
+    def test_unchecked_accounts_precede_previously_completed_accounts_next_round(self):
+        checked = self.friend("alpha")
+        unchecked = self.friend("bravo")
+        unchecked.identity = np.flip(checked.identity, axis=1).copy()
+        self.runner.save_progress(checked, set(), complete=True)
+        restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
+        self.runner.checked = restored.checked
+        self.scan_pages([[checked], [unchecked]])
+        self.assertIs(self.runner.next_friend(), unchecked)
+
+    def test_completed_account_is_checked_again_on_a_new_visit(self):
+        friend = self.friend()
+        self.runner.save_progress(friend, {"L1-1"}, complete=True)
+        restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
+        restored.move = Mock()
+        restored.take_plot = Mock(return_value="taken")
+        restored.walk(friend)
+        self.assertEqual(restored.take_plot.call_count, 24)
+        self.assertNotEqual(restored.checked_at(friend), "")
+
+    def test_run_checks_the_next_account_after_an_isolated_unknown(self):
+        first = self.friend("alpha")
+        second = self.friend("bravo")
+        second.identity = np.flip(first.identity, axis=1).copy()
+        self.runner.home = Mock()
+        self.runner.visit = Mock()
+        self.runner.next_friend = Mock(side_effect=[first, second, None])
+        self.runner.move = Mock()
+        self.runner.take_plot = Mock(side_effect=["unknown", "unknown"] + ["taken"] * 23 + ["unavailable"] * 24)
+        report = self.runner.run()
+        self.assertEqual(len(report["visits"]), 2)
+        self.assertFalse(report["visits"][0]["complete"])
+        self.assertTrue(report["visits"][1]["complete"])
+        self.assertEqual(report["outcomes"]["taken"], 23)
+        self.assertEqual(report["pending_friends"], ["alpha"])
+        self.assertIn("下轮补查", report["status"])
+
+    def test_run_reports_partial_progress_when_own_farm_deadline_interrupts(self):
+        friend = self.friend()
+        self.runner.home = Mock()
+        self.runner.visit = Mock()
+        self.runner.next_friend = Mock(return_value=friend)
+        self.runner.move = Mock(side_effect=[None, None, f.StopVisit("已接近下次自家务农时间")])
+        self.runner.take_plot = Mock(return_value="taken")
+        report = self.runner.run()
+        self.assertFalse(report["visits"][0]["complete"])
+        self.assertEqual(report["outcomes"]["taken"], 1)
+        self.assertEqual(report["pending_friends"], ["alpha"])
+        self.assertIn("自家务农时间", report["status"])
+        restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
+        self.assertEqual(restored.pending_for(friend)["taken"], {"L1-1"})
+
+    def test_dry_run_does_not_save_progress_or_completed_accounts(self):
+        self.runner.dry_run = True
+        self.runner.save_progress(self.friend(), {"L1-1"})
+        self.runner.save_progress(self.friend(), {"L1-1"}, complete=True)
+        self.assertFalse(self.runner.limit.path.exists())
+        self.assertEqual(self.runner.pending, [])
+        self.assertEqual(self.runner.checked, [])
 
 
 class MainFlowTests(unittest.TestCase):

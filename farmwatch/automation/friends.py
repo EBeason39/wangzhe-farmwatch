@@ -219,10 +219,10 @@ class Vision:
 
     @staticmethod
     def same_friend(a, b):
-        if a.name and b.name:
-            return a.name == b.name
+        if a.name and b.name and a.name == b.name:
+            return True
         # If OCR fails, only a near-identical name image can suppress a visit.
-        if a.identity.std() < 8 or b.identity.std() < 8:
+        if a.identity.shape != b.identity.shape or a.identity.std() < 8 or b.identity.std() < 8:
             return False
         return float(cv2.matchTemplate(a.identity, b.identity, cv2.TM_CCOEFF_NORMED)[0, 0]) >= .985
 
@@ -240,11 +240,14 @@ class Vision:
         h, w = shape.shape
         matched = edges[y:y+h, x:x+w]
         strength = float(np.median(matched[inner]) - np.median(matched[outer]))
-        # Real frames separate at 26–39 for lit palms and 6–17 for dim palms.
-        # Keep an uncertain interval, and require a strong shape before clicking.
+        # Foliage behind a dim palm can raise its edge strength to 20–21.
+        # Extend only the disabled band for strong shapes; never lower the
+        # clickable threshold, and keep 23–25 uncertain.
         if score >= .80 and strength >= 25:
             return (985 + x + w//2, 508 + y + h//2), False
-        return None, bool(score >= .55 and 3 <= strength <= 20)
+        dim = (score >= .55 and 3 <= strength <= 20
+               or score >= .80 and 20 < strength <= 23)
+        return None, bool(dim)
 
     def plot(self, image):
         if self.panel_open(image) or not self.at_friend(image):
@@ -285,17 +288,77 @@ def load_route(path=ROUTE_PATH):
 
 
 class Runner:
-    def __init__(self, host, wake_time, *, dry_run=False, max_seconds=600):
+    def __init__(self, host, wake_time, *, dry_run=False, max_seconds=None):
         self.host = host
         self.wake_time = wake_time
         self.dry_run = dry_run
-        self.deadline = time.monotonic() + max(0, min(max_seconds, (wake_time-host.datetime.now()).total_seconds()-15))
+        available_seconds = (wake_time-host.datetime.now()).total_seconds() - 15
+        if max_seconds is not None:
+            available_seconds = min(max_seconds, available_seconds)
+        self.deadline = time.monotonic() + max(0, available_seconds)
         self.vision = Vision(host.TEMPLATE_DIR, host.get_ocr())
         self.route = load_route()
         self.limit = DailyLimit(host.DATA_DIR / "friend_visits_state.json", host.MUMU_NAME)
         self.report = {"started": datetime.now(CHINA_TZ).isoformat(), "dry_run": dry_run,
                        "route_version": self.route.get("version"), "visits": [], "status": "started"}
         self.visited = []
+        self.pending = self.load_progress("pending_visits")
+        self.checked = self.load_progress("checked_friends")
+
+    def load_progress(self, key):
+        pending = []
+        entries = self.limit.data.get(key, [])
+        if not isinstance(entries, list):
+            return pending
+        plot_ids = {stop["id"] for stop in self.route["stops"]}
+        for entry in entries[:128]:
+            try:
+                if entry["route_version"] != self.route.get("version"):
+                    continue
+                shape = entry["identity_shape"]
+                if shape != [36, 252]:
+                    continue
+                identity = np.frombuffer(bytes.fromhex(entry["identity"]), dtype=np.uint8).reshape(shape).copy()
+                friend = Friend(0, True, False, identity, str(entry.get("name", "")))
+                checked_at = entry.get("checked_at", "")
+                if not isinstance(checked_at, str):
+                    continue
+                pending.append({"friend": friend, "taken": set(entry.get("taken_plots", [])) & plot_ids,
+                                "checked_at": checked_at})
+            except (KeyError, TypeError, ValueError):
+                continue
+        return pending
+
+    def pending_for(self, friend):
+        return next((item for item in self.pending
+                     if Vision.same_friend(friend, item["friend"])), None)
+
+    def checked_at(self, friend):
+        return next((item["checked_at"] for item in self.checked
+                     if Vision.same_friend(friend, item["friend"])), "")
+
+    def save_progress(self, friend, taken, *, complete=False):
+        if friend is None or self.dry_run:
+            return
+        previous = self.pending_for(friend)
+        if previous is not None:
+            self.pending = [item for item in self.pending if item is not previous]
+        if not complete:
+            self.pending.append({"friend": friend, "taken": set(taken), "checked_at": ""})
+        else:
+            self.checked = [item for item in self.checked
+                            if not Vision.same_friend(friend, item["friend"])]
+            self.checked.append({"friend": friend, "taken": set(),
+                                 "checked_at": datetime.now(CHINA_TZ).isoformat()})
+        for key, items in (("pending_visits", self.pending), ("checked_friends", self.checked)):
+            self.limit.data[key] = [
+                {"route_version": self.route.get("version"), "name": item["friend"].name,
+                 "identity_shape": list(item["friend"].identity.shape),
+                 "identity": item["friend"].identity.astype(np.uint8).tobytes().hex(),
+                 "taken_plots": sorted(item["taken"]), "checked_at": item["checked_at"]}
+                for item in items
+            ]
+        self.limit.observe()
 
     def guard(self):
         blocked_until = take_blocked_until()
@@ -362,20 +425,17 @@ class Runner:
                 raise StopVisit("好友列表滚动失败")
         time.sleep(.5)
 
-    def next_friend(self):
+    def scan_friends(self):
         self.open_social()
         last = None
         for _ in range(12):
             image = self.capture()
             rows = self.vision.friends(image)
-            for row in rows:
-                if not row.pinned or not row.available or any(self.vision.same_friend(row, old) for old in self.visited):
-                    continue
-                fresh = self.vision.friends(self.capture())
-                match = next((candidate for candidate in fresh
-                              if candidate.pinned and candidate.available and self.vision.same_friend(row, candidate)), None)
-                if match:
-                    return match
+            if not rows:
+                time.sleep(.6)
+                image = self.capture()
+                rows = self.vision.friends(image)
+            yield rows
             if not rows or not any(row.pinned for row in rows):
                 break  # Pinned entries occupy the top yellow group.
             part = image[85:616, 709:1266]
@@ -387,16 +447,48 @@ class Runner:
             if result.returncode != 0:
                 raise StopVisit("好友列表滚动失败")
             time.sleep(.6)
-        return None
+
+    def next_friend(self):
+        candidates = []
+        for rows in self.scan_friends():
+            for row in rows:
+                if (not row.pinned
+                        or any(self.vision.same_friend(row, old) for old in self.visited)
+                        or any(self.vision.same_friend(row, old) for old in candidates)):
+                    continue
+                candidates.append(row)
+        print(f"  好友扫描: 待检查置顶 {len(candidates)}，可拿取图标 "
+              f"{sum(row.available for row in candidates)}，待补查 "
+              f"{sum(self.pending_for(row) is not None for row in candidates)}", flush=True)
+        # The ready badge is a scheduling hint: an absent or missed badge must
+        # not suppress a pinned account or an interrupted farm's remaining plots.
+        candidates.sort(key=lambda row: (self.pending_for(row) is None, not row.available,
+                                         self.checked_at(row)))
+        if not candidates:
+            return None
+        for target in candidates:
+            for rows in self.scan_friends():
+                if not any(row.pinned and self.vision.same_friend(target, row) for row in rows):
+                    continue
+                fresh = self.vision.friends(self.capture())
+                match = next((row for row in fresh if row.pinned
+                              and self.vision.same_friend(target, row)), None)
+                if match is not None:
+                    return match
+            print(f"  ⚠️ 置顶好友 {target.name or '昵称未识别'} 未能重新定位，检查其他好友", flush=True)
+        raise StopVisit("置顶好友重新定位失败，保留未完成进度")
 
     def visit(self, friend):
-        self.visited.append(friend)
+        print(f"  拜访置顶好友: {friend.name or '昵称未识别'} "
+              f"(可拿取图标={'有' if friend.available else '无'}，"
+              f"补查={'是' if self.pending_for(friend) else '否'})", flush=True)
         self.tap(1228, friend.y)
         for _ in range(35):
             time.sleep(1)
             image = self.capture()
             if self.vision.at_friend(image) and not self.vision.panel_open(image):
                 time.sleep(1)
+                self.visited.append(friend)
                 return
         raise StopVisit("拜访加载超时")
 
@@ -415,8 +507,15 @@ class Runner:
         if state.remaining is not None:
             self.limit.observe(state.remaining)
 
+    @staticmethod
+    def unknown_plot(plot_id, state):
+        print(f"  ⚠️ 好友地块 {plot_id} 识别详情: 选中={state.selected}，"
+              f"按钮={state.button}，禁用={state.disabled}，剩余次数={state.remaining}，"
+              f"库存={state.stock}，反馈={state.feedback}，OCR={state.text[:240]}", flush=True)
+        return "unknown"
+
     def take_plot(self, plot_id):
-        """Only return resolved outcomes; unknown aborts this friend's route."""
+        """Only return resolved outcomes; the route handles uncertain stops."""
         before = self.vision.plot(self.capture(f"friend_{plot_id}_before"))
         self.remember(before)
         self.guard()
@@ -426,7 +525,7 @@ class Runner:
             self.remember(before)
             self.guard()
         if not before.selected:
-            return "unknown"
+            return self.unknown_plot(plot_id, before)
         if self.dry_run:
             return "observed"
         # A previous plot's toast survives movement (recording frame 18).
@@ -445,7 +544,7 @@ class Runner:
             before = stable
         for _ in range(2):
             if before.button is None:
-                return "unknown"
+                return self.unknown_plot(plot_id, before)
             self.tap(*before.button)
             for _ in range(3):
                 time.sleep(.45)
@@ -461,21 +560,36 @@ class Runner:
                 if after.selected and after.disabled:
                     return "unavailable"
             before = after
-        return "unknown"
+        return self.unknown_plot(plot_id, before)
 
     def walk(self, friend=None):
         visit = {"friend": friend.name if friend else "", "plots": [], "complete": False}
         self.report["visits"].append(visit)
+        pending = self.pending_for(friend) if friend is not None else None
+        taken = set(pending["taken"]) if pending else set()
+        self.save_progress(friend, taken)
         self.move(self.route["entry"])
+        consecutive_unknown = 0
         for stop in self.route["stops"]:
             self.move(stop["moves"])
-            outcome = self.take_plot(stop["id"])
+            outcome = "already_taken" if stop["id"] in taken else self.take_plot(stop["id"])
+            if outcome == "unknown":
+                print(f"  ⚠️ 好友地块 {stop['id']} 结果未确认，原地复查", flush=True)
+                time.sleep(.8)
+                outcome = self.take_plot(stop["id"])
             visit["plots"].append({"id": stop["id"], "outcome": outcome})
             print(f"  好友地块 {stop['id']}: {outcome}", flush=True)
-            if outcome == "unknown":
-                print("  ⚠️ 未确认地块结果，中止该好友路线", flush=True)
+            if outcome == "taken":
+                taken.add(stop["id"])
+            self.save_progress(friend, taken)
+            consecutive_unknown = consecutive_unknown + 1 if outcome == "unknown" else 0
+            if consecutive_unknown >= 3:
+                print("  ⚠️ 连续三块结果未确认，保留进度并切换下一好友", flush=True)
                 return
-        visit["complete"] = True
+        visit["complete"] = all(plot["outcome"] != "unknown" for plot in visit["plots"])
+        self.save_progress(friend, taken, complete=visit["complete"])
+        if not visit["complete"]:
+            print("  ⚠️ 本好友仍有未确认地块，下轮优先补查", flush=True)
 
     def home(self):
         image = self.capture()
@@ -501,7 +615,7 @@ class Runner:
             for _ in range(12):
                 friend = self.next_friend()
                 if friend is None:
-                    self.report["status"] = "没有待检查的可拿取置顶好友"
+                    self.report["status"] = "置顶好友已全部检查"
                     break
                 self.visit(friend)
                 self.walk(friend)
@@ -517,7 +631,11 @@ class Runner:
             self.report["finished"] = datetime.now(CHINA_TZ).isoformat()
             plots = [plot for visit in self.report["visits"] for plot in visit["plots"]]
             self.report["outcomes"] = {outcome: sum(p["outcome"] == outcome for p in plots)
-                                       for outcome in ("taken", "unavailable", "unknown", "observed")}
+                                       for outcome in ("taken", "unavailable", "unknown", "observed", "already_taken")}
+            self.report["pending_friends"] = [item["friend"].name for item in self.pending]
+            incomplete = [visit for visit in self.report["visits"] if not visit["complete"]]
+            if (incomplete or self.pending) and self.report["status"] == "置顶好友已全部检查":
+                self.report["status"] = "置顶好友已遍历，未确认地块留待下轮补查"
             atomic_json(self.host.DATA_DIR / "friend_visits_last_run.json", self.report)
             print(f"  好友拿取结束: {self.report['status']}", flush=True)
         return self.report
