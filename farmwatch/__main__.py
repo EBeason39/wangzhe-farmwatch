@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -89,6 +90,9 @@ def run(settings, args):
                 app = FarmApp(settings, notifier=Notifier(settings), clock=Clock(guard.should_stop))
                 app.max_rounds = 1 if args.once else None
                 app.status_callback = guard.update
+                app._resume_wake_time = args.resume_wake_time
+                app._pending_target_time = args.resume_target_time
+                app._pending_target_is_absolute = args.resume_target_time is not None
                 app.maintenance(force=True)
                 app.time.on_tick = app.maintenance
                 def stop_signal(_signum, _frame):
@@ -118,14 +122,24 @@ def run(settings, args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog='farmwatch', description=APP_NAME)
-    parser.add_argument('action', choices=['run', 'start', 'stop', 'status', 'check', 'selftest', 'init-config'])
+    parser.add_argument('action', choices=['run', 'start', 'restart', 'stop', 'status', 'check', 'selftest', 'init-config'])
     parser.add_argument('--config', type=Path, help='自定义 INI 配置路径，默认项目根目录 settings.ini')
     parser.add_argument('--once', action='store_true', help='前台仅执行一轮，随后退出并关闭托管模拟器')
     parser.add_argument('--background', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--run-id', help=argparse.SUPPRESS)
+    parser.add_argument('--resume-wake-time', type=datetime.fromisoformat, help=argparse.SUPPRESS)
+    parser.add_argument('--resume-target-time', type=datetime.fromisoformat, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     if args.once and args.action != 'run':
         parser.error('--once 仅用于 run')
+    if (args.resume_wake_time is not None or args.resume_target_time is not None) and args.action != 'run':
+        parser.error('恢复等待参数仅用于 run')
+    if args.resume_target_time is not None and args.resume_wake_time is None:
+        parser.error('恢复目标时间必须同时提供唤醒时间')
+    if any(value is not None and value.tzinfo is not None for value in (args.resume_wake_time, args.resume_target_time)):
+        parser.error('恢复时间必须使用本地时间')
+    if args.resume_target_time is not None and args.resume_target_time < args.resume_wake_time:
+        parser.error('恢复目标时间不能早于唤醒时间')
     try:
         validate_runtime()
         if args.action == 'init-config':
@@ -140,12 +154,16 @@ def main(argv=None):
             active = is_running(ROOT, record)
             print(json.dumps({'running': active, 'phase': record.get('phase', 'not_started'),
                               'pid': record.get('pid') if active else None,
-                              'exit_code': record.get('exit_code')}, ensure_ascii=False))
+                              'exit_code': record.get('exit_code'), 'wake_time': record.get('wake_time'),
+                              'target_time': record.get('target_time')}, ensure_ascii=False))
             return 0
         settings = load_settings(args.config)
         if args.action == 'start':
             from farmwatch.runtime.process import start_background
             return start_background(ROOT, config_path=args.config)
+        if args.action == 'restart':
+            from farmwatch.runtime.process import restart_background
+            return restart_background(ROOT, config_path=args.config, wake_ahead_min=settings.wake_ahead_min)
         if args.action == 'selftest':
             return selftest(settings)
         if args.action == 'check':

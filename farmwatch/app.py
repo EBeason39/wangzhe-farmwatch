@@ -76,6 +76,8 @@ class FarmApp(DeviceActions, CropScheduling, Recognition, GameUpdates, FarmWorkf
         self.CROP_NAME_UI_WORDS = {'农场', '满级', '成熟', '升级', '可升级', '农场经验', '可收获', '已成熟', '等级', '水分', '今天', '明天', '后天', '变异'}
         self.GAME_UPDATE_DIR = f'/sdcard/Android/data/{self.GAME_PKG}/files/iips_download'
         self._pending_target_time = None
+        self._pending_target_is_absolute = False
+        self._resume_wake_time = None
         self.ADB = resolve_adb(self.settings)
         self.DEVICE = self.settings.device or '127.0.0.1:16704'
         self._device_env_value = self.settings.device or None

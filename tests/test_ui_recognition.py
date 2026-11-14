@@ -96,36 +96,6 @@ class UiRecognitionTests(unittest.TestCase):
                 app.locate_farm_action("screen.png"), match
             )
 
-    def test_approach_supplements_short_move_instead_of_repeating_full_move(self):
-        cfg = {"center": (160, 486), "angle": 120, "distance": 200, "duration": 1500}
-        with (
-            patch.object(app, "statue_path", cfg),
-            patch.object(
-                app,
-                "check_at_initial_position",
-                side_effect=[True, False],
-            ),
-            patch.object(app, "reset_position") as reset,
-            patch.object(app, "move_joystick") as move,
-            patch.object(app.time, "sleep"),
-            patch.object(app, "screenshot"),
-            patch.object(
-                app,
-                "locate_farm_action",
-                side_effect=[None, {"x": 855, "y": 413, "score": 0.86}],
-            ),
-        ):
-            self.assertTrue(app.approach_farm_control())
-
-        reset.assert_not_called()
-        self.assertEqual(
-            move.call_args_list,
-            [
-                call(120, 200, 1500, center=(160, 486)),
-                call(120, 200, 950, center=(160, 486)),
-            ],
-        )
-
     def test_login_start_detection_accepts_new_start_template(self):
         def detect(template_name, _path, _threshold):
             if template_name == "session.start":

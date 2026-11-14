@@ -23,6 +23,7 @@ CHINA_TZ = timezone(timedelta(hours=8))
 SIZE = (1280, 720)
 ROOT = Path(__file__).resolve().parents[2]
 ROUTE_PATH = ROOT / "resources" / "routes" / "pinned-friends.json"
+ROUTE_SYNC_VERSION = 1
 
 
 def take_blocked_until(now=None):
@@ -221,10 +222,54 @@ class Vision:
     def same_friend(a, b):
         if a.name and b.name and a.name == b.name:
             return True
-        # If OCR fails, only a near-identical name image can suppress a visit.
         if a.identity.shape != b.identity.shape or a.identity.std() < 8 or b.identity.std() < 8:
             return False
-        return float(cv2.matchTemplate(a.identity, b.identity, cv2.TM_CCOEFF_NORMED)[0, 0]) >= .985
+        raw_score = float(cv2.matchTemplate(a.identity, b.identity, cv2.TM_CCOEFF_NORMED)[0, 0])
+        if raw_score >= .985:
+            return True
+        if raw_score < .90:
+            return False
+        # 昵称栏半透明，回家后背景与光照变化会拉低整条图像的相关性。
+        # 只比较高频亮字，允许最多两像素偏移；不使用模糊昵称合并账号。
+        details = []
+        for identity in (a.identity, b.identity):
+            gray = identity.astype(np.float32)
+            detail = np.maximum(gray - cv2.GaussianBlur(gray, (0, 0), 2), 0)
+            if detail.std() < 8:
+                return False
+            details.append(detail)
+        padded = cv2.copyMakeBorder(details[1], 2, 2, 2, 2, cv2.BORDER_REPLICATE)
+        score = cv2.minMaxLoc(cv2.matchTemplate(padded, details[0], cv2.TM_CCOEFF_NORMED))[1]
+        return float(score) >= .985
+
+    @staticmethod
+    def same_list_position(previous, current):
+        """比较可见行的位置和身份，而不是社交面板后持续变化的农场画面。"""
+        return bool(previous and len(previous) == len(current) and all(
+            abs(old.y - new.y) <= 2 and Vision.same_friend(old, new)
+            for old, new in zip(previous, current)
+        ))
+
+    @staticmethod
+    def scene_signature(image):
+        """仅比较农场背景，排除作物卡、操作按钮、人物及昵称动画。"""
+        gray = cv2.cvtColor(image[130:610, 235:975], cv2.COLOR_BGR2GRAY)
+        small = cv2.resize(cv2.GaussianBlur(gray, (5, 5), 0), (160, 104))
+        small[24:104, 59:117] = 0
+        return small
+
+    def scene_wait_reason(self, image):
+        if not self.at_friend(image):
+            return "好友农场尚未加载"
+        if self.panel_open(image):
+            return "好友面板尚未收起"
+        message = re.sub(r"\s+", "", self.read(image, (350, 155, 960, 500)))
+        match = re.search(
+            r"网络(?:连接)?(?:异常|失败|中断|断开|不稳)|重新连接|正在重连|"
+            r"正在连接|连接服务器(?:中|失败)|与服务器.{0,6}(?:断开|中断)|正在加载|加载中",
+            message,
+        )
+        return match.group(0) if match else None
 
     def take_button(self, image):
         """Match the palm boundary, excluding scenery inside the translucent UI."""
@@ -272,6 +317,10 @@ class StopVisit(RuntimeError):
     pass
 
 
+class RouteSyncLost(RuntimeError):
+    """相对走位已失去可信起点，必须复原，不能继续后续路线。"""
+
+
 def load_route(path=ROUTE_PATH):
     route = json.loads(Path(path).read_text(encoding="utf-8"))
     if route.get("resolution") != list(SIZE):
@@ -300,8 +349,11 @@ class Runner:
         self.route = load_route()
         self.limit = DailyLimit(host.DATA_DIR / "friend_visits_state.json", host.MUMU_NAME)
         self.report = {"started": datetime.now(CHINA_TZ).isoformat(), "dry_run": dry_run,
-                       "route_version": self.route.get("version"), "visits": [], "status": "started"}
+                       "route_version": self.route.get("version"), "route_sync_version": ROUTE_SYNC_VERSION,
+                       "visits": [], "status": "started"}
         self.visited = []
+        self._settled_signature = None
+        self._wait_had_blocker = False
         self.pending = self.load_progress("pending_visits")
         self.checked = self.load_progress("checked_friends")
 
@@ -313,7 +365,8 @@ class Runner:
         plot_ids = {stop["id"] for stop in self.route["stops"]}
         for entry in entries[:128]:
             try:
-                if entry["route_version"] != self.route.get("version"):
+                if (entry["route_version"] != self.route.get("version")
+                        or entry.get("route_sync_version") != ROUTE_SYNC_VERSION):
                     continue
                 shape = entry["identity_shape"]
                 if shape != [36, 252]:
@@ -352,7 +405,8 @@ class Runner:
                                  "checked_at": datetime.now(CHINA_TZ).isoformat()})
         for key, items in (("pending_visits", self.pending), ("checked_friends", self.checked)):
             self.limit.data[key] = [
-                {"route_version": self.route.get("version"), "name": item["friend"].name,
+                {"route_version": self.route.get("version"), "route_sync_version": ROUTE_SYNC_VERSION,
+                 "name": item["friend"].name,
                  "identity_shape": list(item["friend"].identity.shape),
                  "identity": item["friend"].identity.astype(np.uint8).tobytes().hex(),
                  "taken_plots": sorted(item["taken"]), "checked_at": item["checked_at"]}
@@ -387,8 +441,55 @@ class Runner:
         if result.returncode != 0:
             raise StopVisit("ADB 点击失败")
 
+    def wait_scene_ready(self, timeout_s=12.0):
+        """三对新帧稳定且无加载/网络提示后，才允许下一条相对走位。"""
+        previous = None
+        stable_pairs = 0
+        last_reason = None
+        started = time.monotonic()
+        self._wait_had_blocker = False
+        for _ in range(math.ceil(timeout_s / .5) + 1):
+            self.guard()
+            image = self.capture("friend_scene_wait")
+            reason = self.vision.scene_wait_reason(image)
+            if reason:
+                self._wait_had_blocker = True
+                if reason != last_reason:
+                    print(f"  ⏳ 暂停好友走位，等待恢复: {reason}", flush=True)
+                previous = None
+                stable_pairs = 0
+            else:
+                signature = Vision.scene_signature(image)
+                diff = float(np.mean(cv2.absdiff(signature, previous))) if previous is not None else float("inf")
+                stable_pairs = stable_pairs + 1 if diff <= 2.0 else 0
+                previous = signature
+                if stable_pairs >= 3:
+                    self._settled_signature = signature
+                    return image
+            last_reason = reason
+            if time.monotonic() - started >= timeout_s:
+                break
+            time.sleep(.5)
+        self._settled_signature = None
+        raise RouteSyncLost(f"好友画面未恢复稳定（{last_reason or '持续移动/回退'}）")
+
+    def check_route_position(self, image, context):
+        if (self._settled_signature is not None and
+                np.mean(cv2.absdiff(Vision.scene_signature(image), self._settled_signature)) > 2.0):
+            self._settled_signature = None
+            raise RouteSyncLost(f"{context}场景位置发生变化，可能是延迟移动或网络回退")
+
     def move(self, moves):
         for angle, duration in moves:
+            self.guard()
+            before = self.capture("friend_move_before")
+            self.check_route_position(before, "走位前")
+            if self.vision.scene_wait_reason(before):
+                self.wait_scene_ready()
+                raise RouteSyncLost("走位前出现加载/网络提示，恢复后必须重新定位")
+            if self._settled_signature is None:
+                before = self.wait_scene_ready()
+            before_signature = Vision.scene_signature(before)
             self.guard()
             x, y = self.route["joystick_center"]
             radius = self.route["joystick_radius"]
@@ -397,7 +498,24 @@ class Runner:
             result = self.host.adb_shell_result(f"input swipe {x} {y} {tx} {ty} {duration}")
             if result.returncode != 0:
                 raise StopVisit("ADB 走位失败")
-        time.sleep(.35)
+            after = self.wait_scene_ready()
+            if self._wait_had_blocker:
+                self._settled_signature = None
+                raise RouteSyncLost("走位期间出现加载/网络提示，不能继续后续路线")
+            displacement = float(np.mean(cv2.absdiff(Vision.scene_signature(after), before_signature)))
+            if displacement < 4.0:
+                self._settled_signature = None
+                raise RouteSyncLost("走位后场景未变化，移动未生效或被网络回退")
+
+    def reset_friend_origin(self):
+        # 不在仍加载/重连的画面上连续操作。无法复原时保留进度并放弃本好友。
+        self.wait_scene_ready()
+        self.guard()
+        reset = getattr(self.host, "reset_position", None)
+        if not callable(reset) or not reset():
+            raise RouteSyncLost("好友农场复原失败，不能从未知位置继续")
+        self._settled_signature = None
+        self.wait_scene_ready()
 
     def open_social(self):
         image = self.capture()
@@ -417,17 +535,25 @@ class Runner:
         time.sleep(.4)
         if not self.vision.panel_open(self.capture()):
             raise StopVisit("未确认游戏好友列表")
-        # Start from the top even if the panel remembers its previous scroll.
-        for _ in range(3):
+        # 面板会记住滚动位置。向下拖动回到列表顶部，但到顶即停，
+        # 不再无条件连滑三次；较深的列表也能有界恢复到置顶区。
+        previous = self.vision.friends(self.capture())
+        for _ in range(12):
             self.guard()
             result = self.host.adb_shell_result("input swipe 1020 150 1020 590 350")
             if result.returncode != 0:
                 raise StopVisit("好友列表滚动失败")
-        time.sleep(.5)
+            time.sleep(.5)
+            current = self.vision.friends(self.capture())
+            if Vision.same_list_position(previous, current):
+                break
+            previous = current
+        else:
+            raise StopVisit("好友列表回顶未能确认，保留未完成进度")
 
     def scan_friends(self):
         self.open_social()
-        last = None
+        previous = None
         for _ in range(12):
             image = self.capture()
             rows = self.vision.friends(image)
@@ -436,17 +562,21 @@ class Runner:
                 image = self.capture()
                 rows = self.vision.friends(image)
             yield rows
-            if not rows or not any(row.pinned for row in rows):
-                break  # Pinned entries occupy the top yellow group.
-            part = image[85:616, 709:1266]
-            if last is not None and np.mean(cv2.absdiff(part, last)) < 2:
+            if not rows or not rows[-1].pinned:
+                break  # 置顶行在最前；最后一行已非置顶就不再多翻一页。
+            if Vision.same_list_position(previous, rows):
                 break
-            last = part.copy()
+            previous = rows
             self.guard()
             result = self.host.adb_shell_result("input swipe 1020 554 1020 190 550")
             if result.returncode != 0:
                 raise StopVisit("好友列表滚动失败")
             time.sleep(.6)
+
+    def visible_friend(self, target):
+        """只返回新截图中仍置顶、且身份匹配的目标，绝不复用旧行坐标。"""
+        return next((row for row in self.vision.friends(self.capture())
+                     if row.pinned and self.vision.same_friend(target, row)), None)
 
     def next_friend(self):
         candidates = []
@@ -467,12 +597,15 @@ class Runner:
         if not candidates:
             return None
         for target in candidates:
+            # 少量置顶好友通常仍在当前页，重新确认后即可直接选择。
+            # 只有当前页没有目标时才回顶重扫，避免上下滑一整轮。
+            match = self.visible_friend(target)
+            if match is not None:
+                return match
             for rows in self.scan_friends():
                 if not any(row.pinned and self.vision.same_friend(target, row) for row in rows):
                     continue
-                fresh = self.vision.friends(self.capture())
-                match = next((row for row in fresh if row.pinned
-                              and self.vision.same_friend(target, row)), None)
+                match = self.visible_friend(target)
                 if match is not None:
                     return match
             print(f"  ⚠️ 置顶好友 {target.name or '昵称未识别'} 未能重新定位，检查其他好友", flush=True)
@@ -487,7 +620,8 @@ class Runner:
             time.sleep(1)
             image = self.capture()
             if self.vision.at_friend(image) and not self.vision.panel_open(image):
-                time.sleep(1)
+                self._settled_signature = None
+                self.wait_scene_ready()
                 self.visited.append(friend)
                 return
         raise StopVisit("拜访加载超时")
@@ -514,18 +648,34 @@ class Runner:
               f"库存={state.stock}，反馈={state.feedback}，OCR={state.text[:240]}", flush=True)
         return "unknown"
 
-    def take_plot(self, plot_id):
-        """Only return resolved outcomes; the route handles uncertain stops."""
-        before = self.vision.plot(self.capture(f"friend_{plot_id}_before"))
-        self.remember(before)
+    def selected_plot_state(self, plot_id):
+        image = self.capture(f"friend_{plot_id}_before")
+        self.check_route_position(image, "拿取前")
+        if self.vision.scene_wait_reason(image):
+            self._settled_signature = None
+            raise RouteSyncLost(f"地块 {plot_id} 拿取前网络/加载中断，必须重新定位")
+        state = self.vision.plot(image)
+        self.remember(state)
         self.guard()
-        if not before.selected:
-            time.sleep(.6)
-            before = self.vision.plot(self.capture())
-            self.remember(before)
+        if not state.selected:
+            ready = self.wait_scene_ready()
+            if self._wait_had_blocker:
+                self._settled_signature = None
+                raise RouteSyncLost(f"地块 {plot_id} 等待时网络/加载中断，必须复原重走")
+            if np.mean(cv2.absdiff(Vision.scene_signature(ready), Vision.scene_signature(image))) > 2.0:
+                self._settled_signature = None
+                raise RouteSyncLost(f"地块 {plot_id} 等待期间位置发生变化，不能沿用原落点")
+            state = self.vision.plot(ready)
+            self.remember(state)
             self.guard()
-        if not before.selected:
-            return self.unknown_plot(plot_id, before)
+        if not state.selected:
+            self._settled_signature = None
+            raise RouteSyncLost(f"地块 {plot_id} 未选中，路线已失去定位")
+        return state
+
+    def take_plot(self, plot_id):
+        """选中状态丢失与拿取反馈不明分开处理，前者禁止继续相对走位。"""
+        before = self.selected_plot_state(plot_id)
         if self.dry_run:
             return "observed"
         # A previous plot's toast survives movement (recording frame 18).
@@ -534,9 +684,7 @@ class Runner:
             return "unavailable"
         if before.button is None:
             time.sleep(.7)
-            stable = self.vision.plot(self.capture())
-            self.remember(stable)
-            self.guard()
+            stable = self.selected_plot_state(plot_id)
             if stable.selected and stable.unripe:
                 return "unavailable"
             if stable.selected and stable.disabled and before.disabled:
@@ -548,8 +696,16 @@ class Runner:
             self.tap(*before.button)
             for _ in range(3):
                 time.sleep(.45)
-                after = self.vision.plot(self.capture(f"friend_{plot_id}_after"))
+                image = self.capture(f"friend_{plot_id}_after")
+                self.check_route_position(image, "拿取中")
+                if self.vision.scene_wait_reason(image):
+                    self._settled_signature = None
+                    raise RouteSyncLost(f"地块 {plot_id} 拿取中网络/加载中断，停止重复点击")
+                after = self.vision.plot(image)
                 self.remember(after)
+                if not after.selected:
+                    self._settled_signature = None
+                    raise RouteSyncLost(f"地块 {plot_id} 拿取中失去定位，停止后续走位")
                 if before.remaining is not None and after.remaining is not None and after.remaining < before.remaining:
                     return "taken"
                 if (before.stock is not None and after.stock is not None and after.stock < before.stock
@@ -568,28 +724,61 @@ class Runner:
         pending = self.pending_for(friend) if friend is not None else None
         taken = set(pending["taken"]) if pending else set()
         self.save_progress(friend, taken)
-        self.move(self.route["entry"])
-        consecutive_unknown = 0
-        for stop in self.route["stops"]:
-            self.move(stop["moves"])
-            outcome = "already_taken" if stop["id"] in taken else self.take_plot(stop["id"])
-            if outcome == "unknown":
-                print(f"  ⚠️ 好友地块 {stop['id']} 结果未确认，原地复查", flush=True)
-                time.sleep(.8)
-                outcome = self.take_plot(stop["id"])
-            visit["plots"].append({"id": stop["id"], "outcome": outcome})
-            print(f"  好友地块 {stop['id']}: {outcome}", flush=True)
-            if outcome == "taken":
-                taken.add(stop["id"])
-            self.save_progress(friend, taken)
-            consecutive_unknown = consecutive_unknown + 1 if outcome == "unknown" else 0
-            if consecutive_unknown >= 3:
-                print("  ⚠️ 连续三块结果未确认，保留进度并切换下一好友", flush=True)
+        # 最多复原重走一次。截止时间/夜间/次数保护仍直接中止整个访问，不能重试。
+        for attempt in range(1, 3):
+            plot_id = "entry"
+            try:
+                self.move(self.route["entry"])
+                consecutive_unknown = 0
+                for stop in self.route["stops"]:
+                    plot_id = stop["id"]
+                    self.move(stop["moves"])
+                    if plot_id in taken:
+                        self.selected_plot_state(plot_id)  # 跳过已拿取地块也要确认没有走偏。
+                        outcome = "already_taken"
+                    else:
+                        outcome = self.take_plot(plot_id)
+                    if outcome == "unknown":
+                        print(f"  ⚠️ 好友地块 {plot_id} 结果未确认，原地复查", flush=True)
+                        time.sleep(.8)
+                        outcome = self.take_plot(plot_id)
+                    previous = next((plot for plot in visit["plots"] if plot["id"] == plot_id), None)
+                    if previous is None:
+                        visit["plots"].append({"id": plot_id, "outcome": outcome})
+                    elif previous["outcome"] != "taken":
+                        previous["outcome"] = outcome
+                    print(f"  好友地块 {plot_id}: {outcome}", flush=True)
+                    if outcome == "taken":
+                        taken.add(plot_id)
+                    self.save_progress(friend, taken)
+                    consecutive_unknown = consecutive_unknown + 1 if outcome == "unknown" else 0
+                    if consecutive_unknown >= 3:
+                        print("  ⚠️ 连续三块拿取反馈未确认，保留进度并切换下一好友", flush=True)
+                        return
+                visit["complete"] = all(plot["outcome"] != "unknown" for plot in visit["plots"])
+                self.save_progress(friend, taken, complete=visit["complete"])
+                if not visit["complete"]:
+                    print("  ⚠️ 本好友仍有未确认地块，下轮优先补查", flush=True)
                 return
-        visit["complete"] = all(plot["outcome"] != "unknown" for plot in visit["plots"])
-        self.save_progress(friend, taken, complete=visit["complete"])
-        if not visit["complete"]:
-            print("  ⚠️ 本好友仍有未确认地块，下轮优先补查", flush=True)
+            except RouteSyncLost as exc:
+                self._settled_signature = None
+                visit.setdefault("route_sync_losses", []).append(
+                    {"attempt": attempt, "plot": plot_id, "reason": str(exc)}
+                )
+                self.save_progress(friend, taken)
+                print(f"  ⚠️ 好友路线失步 ({plot_id}): {exc}，立即停止后续走位", flush=True)
+                if attempt >= 2:
+                    print("  ⚠️ 复原重走后仍失步，保留进度并切换下一好友", flush=True)
+                    return
+                try:
+                    print("  🔄 等待网络/画面恢复，复原后从好友入口重走", flush=True)
+                    self.reset_friend_origin()
+                except RouteSyncLost as reset_error:
+                    visit["route_sync_losses"].append(
+                        {"attempt": attempt, "plot": "reset", "reason": str(reset_error)}
+                    )
+                    print(f"  ⚠️ 无法安全复原: {reset_error}，本好友留待下轮", flush=True)
+                    return
 
     def home(self):
         image = self.capture()

@@ -544,57 +544,49 @@ class FarmWorkflow:
         return False
 
     def approach_farm_control(self, max_attempts=3):
-        """务农定位: 移动到雕像，并确认一键务农按钮已出现。
-
-        ADB swipe 偶发丢帧或角色被场景挡住时，一次移动可能停在半路。这里
-        用一键务农按钮作为到达信号；未到达时继续沿原方向补走。若发现仍在
-        初始石盘，则说明滑动没有生效，用更长按住时间重试。
-        """
+        """固定路线、小步确认；找不到按钮时复原后重试，不累计加长走位。"""
         print("\n[FarmWatch / 务农定位] 移动到雕像...")
-
-        if self.check_at_initial_position():
-            print("  ✅ 在初始位置")
-        else:
-            print("  🔄 不在初始位置，刷新站位...")
-            self.reset_position()
+        self.screenshot(self.SCREENSHOT_PATH)
+        if self.locate_farm_action(self.SCREENSHOT_PATH) is not None:
+            print("  ✅ 已在一键务农处，无需再移动")
+            return True
 
         cfg = self.statue_path
-        was_at_initial = None
+        nudge_ms = 200
+        max_nudges = 3
         for attempt in range(1, max_attempts + 1):
-            if attempt == 1 or was_at_initial:
-                duration_ms = min(3500, cfg["duration"] + (attempt - 1) * 700)
-                label = "重新移动"
-            else:
-                # 已离开起点但按钮还没出现，说明多半是走短了；不要整段重走，
-                # 用短补充位移降低冲过目标点的概率。
-                duration_ms = min(1600, 700 + (attempt - 1) * 250)
-                label = "半路补走"
-            print(
-                f"  🚶 尝试移动到务农点 ({attempt}/{max_attempts}, {label} "
-                f"{duration_ms}ms)"
-            )
+            # 复原图标在角色走开后仍然可见，不能用它推断角色在起点。
+            # 每条完整路线都先明确复原；复原失败时禁止从未知位置盲走。
+            print(f"  🔄 复原到起点后重试 ({attempt}/{max_attempts})")
+            if not self.reset_position():
+                print("  ❌ 无法确认复原操作，停止本次定位")
+                break
+
+            print(f"  🚶 从起点移动 {cfg['duration']}ms")
             self.move_joystick(
-                cfg["angle"],
-                cfg["distance"],
-                duration_ms,
-                center=cfg["center"],
+                cfg["angle"], cfg["distance"], cfg["duration"], center=cfg["center"]
             )
-            print("  ⏳ 等待移动...")
             self.time.sleep(5)
 
-            self.screenshot(self.SCREENSHOT_PATH)
-            if self.locate_farm_action(self.SCREENSHOT_PATH) is not None:
-                print("  ✅ 一键务农按钮已出现")
-                return True
+            for nudge in range(max_nudges + 1):
+                self.screenshot(self.SCREENSHOT_PATH)
+                if self.locate_farm_action(self.SCREENSHOT_PATH) is not None:
+                    print("  ✅ 一键务农按钮已出现")
+                    return True
+                if nudge == max_nudges:
+                    break
 
-            was_at_initial = self.check_at_initial_position()
-            if was_at_initial:
-                print("  ⚠️ 仍在初始位置，滑动可能未生效")
-            else:
-                print("  ⚠️ 一键务农未出现，可能在半路，继续补走")
+                print(f"  🚶 小步补走 ({nudge + 1}/{max_nudges}, {nudge_ms}ms)")
+                self.move_joystick(
+                    cfg["angle"], cfg["distance"], nudge_ms, center=cfg["center"]
+                )
+                self.time.sleep(1)
+
+            if attempt < max_attempts:
+                print("  ⚠️ 三次小步后仍未找到按钮，复原后重新走固定路线")
 
         self.screenshot(self.SCREENSHOT_PATH, archive_label="approach_fail")
-        print("  ❌ 连续移动后仍未找到一键务农按钮")
+        print("  ❌ 定位重试后仍未找到一键务农按钮")
         return False
 
     def perform_farm_action(self):
@@ -789,6 +781,7 @@ class FarmWorkflow:
 
         # 每轮重新计算，先清掉上一轮的目标，避免识别失败时沿用过期时刻。
         self._pending_target_time = None
+        self._pending_target_is_absolute = False
 
         no_schedule = maturity_time is None and result is None and maturity_dt is None
 
@@ -938,7 +931,9 @@ class FarmWorkflow:
         """
 
         target_time = self._pending_target_time
+        absolute_target = self._pending_target_is_absolute
         self._pending_target_time = None
+        self._pending_target_is_absolute = False
         if not isinstance(target_time, self._DATETIME_TYPE):
             return False
 
@@ -948,7 +943,8 @@ class FarmWorkflow:
 
         # 正常情况下 remaining 不会超过提前量；夹紧以防未来改动破坏该前提，
         # 避免误读的目标时间把脚本挂在游戏里空等。
-        remaining = min(remaining, self.WAKE_AHEAD_MIN * 60)
+        if not absolute_target:
+            remaining = min(remaining, self.WAKE_AHEAD_MIN * 60)
         print(
             f"  ⏸️ 早于目标时间 {target_time.strftime('%H:%M:%S')}，"
             f"补等 {int(remaining)} 秒后再务农"
@@ -974,7 +970,11 @@ class FarmWorkflow:
 
         remaining_seconds = (wake_time - self.datetime.now()).total_seconds()
         if remaining_seconds > 0:
-            self.status_callback('waiting', wake_time=wake_time.isoformat())
+            target = self._pending_target_time
+            self.status_callback(
+                'waiting', wake_time=wake_time.isoformat(),
+                target_time=target.isoformat() if isinstance(target, self._DATETIME_TYPE) else None,
+            )
             self.time.sleep(remaining_seconds)
 
         if not self.ensure_emulator_running():
@@ -997,6 +997,14 @@ class FarmWorkflow:
         print("王者农场助手 · FarmWatch")
         print("=" * 60)
         print("  画布：1280×720 · MuMu / Android")
+
+        # 重启等待中的后台时先恢复等待，不提前启动游戏或发送务农动作。
+        resume_wake = self._resume_wake_time
+        self._resume_wake_time = None
+        if isinstance(resume_wake, self._DATETIME_TYPE):
+            print(f"  🔄 恢复原唤醒计划: {resume_wake:%Y-%m-%d %H:%M:%S}")
+            if not self.wait_for_next_round(resume_wake):
+                return 1
 
         if self._manage_mumu:
             print(f"\n🖥️ 准备 MuMu 实例: {self.MUMU_NAME}")
@@ -1069,30 +1077,29 @@ class FarmWorkflow:
                 print("\n⚠️ 进入农场失败，重新开始...")
                 continue
 
-            # 务农定位: 移动到雕像
-            self.approach_farm_control()
-
-            # 补齐提前唤醒量，确保不早于目标时刻点击一键务农
-            self.wait_until_target_time()
-
-            # 执行务农: 一键务农
-            farmed = self.perform_farm_action()
-            if not farmed:
-                print("\n⚠️ 执行务农失败，返回务农定位...")
-                try:
-                    self.screenshot(self.SCREENSHOT_PATH, archive_label="action_fail")
-                except Exception:
-                    pass
-                self.approach_farm_control()
+            # 只有定位成功才等待并点击；定位内部已经执行有界复原重试。
+            positioned = self.approach_farm_control()
+            farmed = False
+            if positioned:
+                # 补齐提前唤醒量，确保不早于目标时刻点击一键务农。
+                self.wait_until_target_time()
                 farmed = self.perform_farm_action()
+                if not farmed:
+                    print("\n⚠️ 执行务农失败，返回务农定位...")
+                    try:
+                        self.screenshot(self.SCREENSHOT_PATH, archive_label="action_fail")
+                    except Exception:
+                        pass
+                    if self.approach_farm_control():
+                        farmed = self.perform_farm_action()
             if not farmed:
                 self.last_round = RoundResult(RoundStatus.ACTION_FAILED)
                 action_failures += 1
-                self._pending_target_time = None
+                # 定位阶段失败时保留尚未消费的目标，重试也不能提前务农。
                 self._exit_game_for_wait()
                 if action_failures >= 3:
                     raise RuntimeError("一键务农连续三轮失败，已停止，未生成成功调度")
-                print("  ⚠️ 本轮点击失败，30 秒后重新进入农场恢复")
+                print("  ⚠️ 本轮定位或点击失败，30 秒后重新进入农场恢复")
                 self.time.sleep(30)
                 continue
             action_failures = 0

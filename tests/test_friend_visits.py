@@ -198,6 +198,7 @@ class RunnerTests(unittest.TestCase):
         self.runner = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
         self.runner.capture = Mock(return_value=np.zeros((720, 1280, 3), np.uint8))
         self.runner.vision = Mock()
+        self.runner.vision.scene_wait_reason.return_value = None
         self.runner.tap = Mock()
         self.sleep = patch.object(f.time, "sleep")
         self.sleep.start()
@@ -268,6 +269,7 @@ class RunnerTests(unittest.TestCase):
         self.runner.save_progress(friend, {"L1-1", "L1-2"})
         restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
         restored.move = Mock()
+        restored.selected_plot_state = Mock(return_value=f.PlotState(selected=True))
         restored.take_plot = Mock(return_value="unavailable")
         restored.walk(friend)
         visit = restored.report["visits"][0]

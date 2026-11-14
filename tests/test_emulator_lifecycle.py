@@ -997,7 +997,7 @@ class TargetTimeCatchUpTests(unittest.TestCase):
                 patch.object(
                     app,
                     "approach_farm_control",
-                    side_effect=lambda: events.append("approach"),
+                    side_effect=lambda: events.append("approach") or True,
                 )
             )
             stack.enter_context(

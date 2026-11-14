@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import call, patch
 
 import farmwatch.runtime.process as process
 
@@ -71,3 +72,50 @@ with InstanceGuard(Path(sys.argv[1])) as guard:
                         child.wait(timeout=5)
                     child.stdout.close()
                     child.stderr.close()
+
+
+class StateWriterTests(unittest.TestCase):
+    def test_temporary_windows_lock_retries_without_losing_atomic_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original_replace = Path.replace
+            count = 0
+            error = PermissionError("temporary sharing lock")
+            error.winerror = 32
+            def replace(source, target):
+                nonlocal count
+                count += 1
+                if count < 3:
+                    raise error
+                return original_replace(source, target)
+            with patch.object(Path, "replace", autospec=True, side_effect=replace), \
+                    patch.object(process.time, "sleep") as sleep:
+                process.write_state(root, {"phase": "running"})
+            self.assertEqual(count, 3)
+            self.assertEqual(sleep.call_args_list, [call(.02), call(.04)])
+            self.assertEqual(process.read_state(root), {"phase": "running"})
+            self.assertEqual(list((root/"tmp").glob(".process-*.tmp")), [])
+
+    def test_persistent_windows_denial_is_bounded_and_preserves_previous_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            process.write_state(root, {"phase": "waiting"})
+            error = PermissionError("access denied")
+            error.winerror = 5
+            with patch.object(Path, "replace", side_effect=error) as replace, \
+                    patch.object(process.time, "sleep") as sleep:
+                with self.assertRaises(PermissionError):
+                    process.write_state(root, {"phase": "running"})
+            self.assertEqual(replace.call_count, 5)
+            self.assertEqual(sleep.call_count, 4)
+            self.assertEqual(process.read_state(root), {"phase": "waiting"})
+            self.assertEqual(list((root/"tmp").glob(".process-*.tmp")), [])
+
+    def test_non_windows_permission_error_is_not_hidden_by_retries(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(Path, "replace", side_effect=PermissionError("permanent permission denial")) as replace, \
+                patch.object(process.time, "sleep") as sleep:
+            with self.assertRaises(PermissionError):
+                process.write_state(Path(directory), {"phase": "running"})
+            replace.assert_called_once()
+            sleep.assert_not_called()

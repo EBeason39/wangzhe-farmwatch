@@ -597,20 +597,27 @@ class Recognition:
         self.swipe(cx, cy, tx, ty, duration_ms)
         print(f"  🎮 摇杆 ({cx},{cy})→({tx},{ty}) {angle_deg}° {duration_ms}ms")
 
-    def check_at_initial_position(self):
-        """检查角色是否在初始位置（石盘）"""
-        self.screenshot(self.SCREENSHOT_PATH)
-        # 通过右下角的归位控件检测可操作状态
-        return self.control_visible("farm.reset", self.SCREENSHOT_PATH, 0.5)
-
     def reset_position(self):
-        """刷新站位重置角色位置"""
-        print("  🔄 刷新站位...")
-        if self.press_control("farm.reset", self.SCREENSHOT_PATH, 0.5, "刷新站位"):
-            print("  ⏳ 等待5秒...")
-            self.time.sleep(5)
-            return True
-        return False
+        """用新截图定位右下角复原按钮；ADB 未接受点击时不继续走位。"""
+        print("  🔄 复原站位...")
+        self.screenshot(self.SCREENSHOT_PATH)
+        match = self.locate_control("farm.reset", self.SCREENSHOT_PATH, 0.5)
+        if match is None:
+            print("  ⚠️ 未找到右下角复原按钮")
+            return False
+        x, y = match["x"], match["y"]
+        print(f"  👆 tap ({x}, {y}) [复原站位]")
+        try:
+            clicked = self.adb_shell_result(f"input tap {x} {y}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  ⚠️ 复原点击异常: {exc}")
+            return False
+        if clicked.returncode != 0:
+            print(f"  ⚠️ 复原点击失败: rc={clicked.returncode}")
+            return False
+        print("  ⏳ 等待复原5秒...")
+        self.time.sleep(5)
+        return True
 
     def parse_crop_name_text(self, text):
         """Extract a known crop name from OCR text, tolerating spaces."""

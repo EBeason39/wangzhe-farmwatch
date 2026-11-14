@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import ctypes
 from ctypes import wintypes as wt
-from datetime import datetime
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
@@ -69,7 +69,15 @@ def write_state(root, data):
     pending = path.with_name(f'.process-{uuid.uuid4().hex}.tmp')
     try:
         pending.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-        pending.replace(path)
+        # Windows 状态读取/杀毒扫描会短暂禁止替换；保留原子写入，仅有界重试。
+        for attempt in range(5):
+            try:
+                pending.replace(path)
+                break
+            except PermissionError as exc:
+                if getattr(exc, 'winerror', None) not in (5, 32, 33) or attempt == 4:
+                    raise
+                time.sleep(.02 * (attempt + 1))
     finally:
         pending.unlink(missing_ok=True)
 
@@ -177,7 +185,7 @@ class InstanceGuard:
                 self.mutex = None
 
 
-def start_background(root, *, config_path=None):
+def start_background(root, *, config_path=None, resume_wake_time=None, resume_target_time=None):
     root = Path(root).resolve()
     if is_running(root):
         print(f"已运行，PID={read_state(root)['pid']}")
@@ -190,6 +198,10 @@ def start_background(root, *, config_path=None):
                'run', '--background', '--run-id', run_id]
     if config_path is not None:
         command.extend(['--config', str(Path(config_path).resolve())])
+    if resume_wake_time is not None:
+        command.extend(['--resume-wake-time', resume_wake_time.isoformat()])
+        if resume_target_time is not None:
+            command.extend(['--resume-target-time', resume_target_time.isoformat()])
     logs = root / 'logs'
     logs.mkdir(exist_ok=True)
     bootstrap = logs / f'farmwatch_bootstrap_{datetime.now():%Y%m%d_%H%M%S}_{run_id[:8]}.log'
@@ -256,3 +268,39 @@ def stop(root, *, timeout=30):
         return 0
     finally:
         dll.CloseHandle(handle)
+
+
+def waiting_resume_plan(record, *, wake_ahead_min=5):
+    """停止旧进程前保存绝对等待计划；新版明确的空目标不会误加提前量。"""
+    if record.get('phase') != 'waiting':
+        return None, None
+    try:
+        wake = datetime.fromisoformat(record['wake_time'])
+        target_value = record.get('target_time')
+        if 'target_time' not in record:
+            # 兼容尚未保存目标时间的旧后台；实际重启前可按日志核对提前量。
+            target = wake + timedelta(minutes=wake_ahead_min)
+        else:
+            target = datetime.fromisoformat(target_value) if target_value is not None else None
+        if wake.tzinfo is not None or target is not None and target.tzinfo is not None:
+            raise ValueError('aware timestamps are not local schedule timestamps')
+        if target is not None and target < wake:
+            raise ValueError('target precedes wake')
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise RuntimeError('等待计划无效，未停止当前后台') from exc
+    return wake, target
+
+
+def restart_background(root, *, config_path=None, wake_ahead_min=5):
+    """正常停止后加载新代码，并恢复等待中的唤醒/务农目标。"""
+    root = Path(root).resolve()
+    wake, target = waiting_resume_plan(read_state(root), wake_ahead_min=wake_ahead_min)
+    if wake is not None:
+        print(f'保留唤醒时间：{wake:%Y-%m-%d %H:%M:%S}')
+        if target is not None:
+            print(f'保留操作目标：{target:%Y-%m-%d %H:%M:%S}')
+    code = stop(root)
+    if code != 0:
+        return code
+    return start_background(root, config_path=config_path,
+                            resume_wake_time=wake, resume_target_time=target)
