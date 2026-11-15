@@ -25,6 +25,8 @@ class PublishedFixtureTests(unittest.TestCase):
                 # needed for crop recognition or friend-row selection.
                 self.assertFalse(np.any(image[:110,:640]))
                 self.assertFalse(np.any(image[680:]))
+                if name.startswith('live_take_scene_'):
+                    self.assertFalse(np.any(image[240:610,508:776]))  # Floating player nickname.
                 if name == 'social.png':
                     for y in [127,233,339,445,551]:
                         self.assertFalse(np.any(image[y-31:y+12,714:793]))

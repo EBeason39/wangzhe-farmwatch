@@ -22,6 +22,11 @@ def frame(shift=0):
     return np.repeat(np.roll(gray, shift, axis=1)[:, :, None], 3, axis=2)
 
 
+def take_scene(variant, phase):
+    path = Path(__file__).parent / "fixtures" / "friends" / f"live_take_scene_{variant}_{phase}.png"
+    return cv2.imread(str(path))
+
+
 class NetworkRunnerCase(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
@@ -105,6 +110,26 @@ class SceneStabilityTests(NetworkRunnerCase):
                 vision.read.return_value = message
                 self.assertIsNone(vision.scene_wait_reason(self.a))
 
+    def test_real_take_effects_change_pixels_without_moving_the_background(self):
+        for variant in ("mutant", "orange"):
+            with self.subTest(variant=variant):
+                before, after = [f.Vision.scene_signature(take_scene(variant, phase))
+                                 for phase in ("before", "after")]
+                # Reproduce the old false route-loss threshold with real effects.
+                self.assertGreater(float(np.mean(cv2.absdiff(before, after))), 2.0)
+                self.assertTrue(f.Vision.same_scene_position(before, after))
+
+    def test_take_effects_do_not_hide_a_real_camera_shift(self):
+        before = f.Vision.scene_signature(take_scene("mutant", "before"))
+        after = f.Vision.scene_signature(np.roll(take_scene("mutant", "after"), 9, axis=1))
+        self.assertFalse(f.Vision.same_scene_position(before, after))
+
+    def test_changed_low_texture_is_not_enough_evidence_of_the_same_position(self):
+        before = np.full((104, 160), 25, np.uint8)
+        after = before.copy()
+        after[:30] = 180
+        self.assertFalse(f.Vision.same_scene_position(before, after))
+
 
 class MovementSynchronizationTests(NetworkRunnerCase):
     def test_each_segment_waits_for_settling_before_the_next_swipe(self):
@@ -174,6 +199,15 @@ class MovementSynchronizationTests(NetworkRunnerCase):
         with self.assertRaisesRegex(f.RouteSyncLost, "复原失败"):
             self.runner.reset_friend_origin()
         self.assertEqual(self.runner.wait_scene_ready.call_count, 1)
+
+    def test_harvest_animation_alone_does_not_prove_a_swipe_was_effective(self):
+        before, after = [take_scene("mutant", phase) for phase in ("before", "after")]
+        self.settled(before)
+        self.runner.capture.return_value = before
+        self.runner.wait_scene_ready = Mock(return_value=after)
+        with self.assertRaisesRegex(f.RouteSyncLost, "场景未变化"):
+            self.runner.move([[0, 1100], [0, 1100]])
+        self.assertEqual(self.host.adb_shell_result.call_count, 1)
 
 
 class PlotSynchronizationTests(NetworkRunnerCase):
@@ -252,6 +286,34 @@ class PlotSynchronizationTests(NetworkRunnerCase):
         with self.assertRaisesRegex(f.RouteSyncLost, "拿取中失去定位"):
             self.runner.take_plot("R3-4")
         self.assertEqual(self.runner.tap.call_count, 1)
+
+    def test_confirmed_takes_survive_real_harvest_effects_without_a_second_click(self):
+        for variant, remaining_stock in (("mutant", 172), ("orange", 148)):
+            with self.subTest(variant=variant):
+                before, after = [take_scene(variant, phase) for phase in ("before", "after")]
+                self.settled(before)
+                self.runner.capture.side_effect = [before, after]
+                self.runner.vision.plot.side_effect = [
+                    f.PlotState(selected=True, stock=180, button=(1073, 569)),
+                    f.PlotState(selected=True, stock=remaining_stock, disabled=True),
+                ]
+                self.runner.tap.reset_mock()
+                self.assertEqual(self.runner.take_plot("L1-1"), "taken")
+                self.runner.tap.assert_called_once_with(1073, 569)
+
+    def test_late_rollback_after_a_confirmed_take_still_blocks_the_next_swipe(self):
+        before, after = [take_scene("mutant", phase) for phase in ("before", "after")]
+        moved = np.roll(after, 9, axis=1)
+        self.settled(before)
+        self.runner.capture.side_effect = [before, after, moved]
+        self.runner.vision.plot.side_effect = [
+            f.PlotState(selected=True, stock=180, button=(1073, 569)),
+            f.PlotState(selected=True, stock=172, disabled=True),
+        ]
+        self.assertEqual(self.runner.take_plot("L1-1"), "taken")
+        with self.assertRaisesRegex(f.RouteSyncLost, "走位前"):
+            self.runner.move([[180, 1100]])
+        self.host.adb_shell_result.assert_not_called()
 
 
 class RouteRecoveryTests(NetworkRunnerCase):

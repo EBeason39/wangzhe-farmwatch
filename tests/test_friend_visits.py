@@ -180,6 +180,18 @@ class RecognitionTests(unittest.TestCase):
         self.assertIsNone(button)
         self.assertFalse(disabled)
 
+    def test_scene_effect_fixtures_preserve_the_confirmed_stock_and_hand_change(self):
+        for variant, remaining_stock in (("mutant", 172), ("orange", 148)):
+            with self.subTest(variant=variant):
+                before = self.vision.plot(self.frame(f"live_take_scene_{variant}_before"))
+                after = self.vision.plot(self.frame(f"live_take_scene_{variant}_after"))
+                self.assertTrue(before.selected and after.selected)
+                self.assertEqual(before.stock, 180)
+                self.assertEqual(after.stock, remaining_stock)
+                self.assertIsNotNone(before.button)
+                self.assertIsNone(after.button)
+                self.assertTrue(after.disabled)
+
 
 class RunnerTests(unittest.TestCase):
     def setUp(self):

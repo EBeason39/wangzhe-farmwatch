@@ -258,6 +258,44 @@ class Vision:
         small[24:104, 59:117] = 0
         return small
 
+    @staticmethod
+    def same_scene_position(previous, current):
+        """拿取光效会改变像素；用分散的静止背景特征复核相机是否真的移动。"""
+        if np.mean(cv2.absdiff(previous, current)) <= 2.0:
+            return True
+        # 排除固定遮罩边缘，避免它们成为永远不动的假背景锚点。
+        mask = np.full(previous.shape, 255, dtype=np.uint8)
+        mask[:4] = mask[-4:] = 0
+        mask[:, :4] = mask[:, -4:] = 0
+        mask[20:, 55:121] = 0
+        points = cv2.goodFeaturesToTrack(previous, 160, .015, 4, mask=mask, blockSize=5)
+        if points is None or len(points) < 20:
+            return False  # 无足够背景证据时仍按失步处理，不能放宽整幅像素阈值。
+        tracked, forward_ok, error = cv2.calcOpticalFlowPyrLK(
+            previous, current, points, None, winSize=(15, 15), maxLevel=2,
+        )
+        if tracked is None:
+            return False
+        returned, backward_ok, _ = cv2.calcOpticalFlowPyrLK(
+            current, previous, tracked, None, winSize=(15, 15), maxLevel=2,
+        )
+        if returned is None:
+            return False
+        valid = (forward_ok.ravel().astype(bool) & backward_ok.ravel().astype(bool)
+                 & (error.ravel() < 25)
+                 & (np.linalg.norm((returned - points).reshape(-1, 2), axis=1) < .8))
+        if np.count_nonzero(valid) < max(20, len(points) * .5):
+            return False
+        displacement = np.linalg.norm((tracked - points).reshape(-1, 2), axis=1)
+        stationary = valid & (displacement <= .35)
+        if np.count_nonzero(stationary) < max(20, np.count_nonzero(valid) * .7):
+            return False
+        # 不能只凭一小片不动的树叶/UI 放行：背景证据必须覆盖宽度和高度。
+        anchors = points.reshape(-1, 2)[stationary]
+        span = np.ptp(anchors, axis=0)
+        return bool(span[0] >= previous.shape[1] * .45
+                    and span[1] >= previous.shape[0] * .45)
+
     def scene_wait_reason(self, image):
         if not self.at_friend(image):
             return "好友农场尚未加载"
@@ -475,7 +513,7 @@ class Runner:
 
     def check_route_position(self, image, context):
         if (self._settled_signature is not None and
-                np.mean(cv2.absdiff(Vision.scene_signature(image), self._settled_signature)) > 2.0):
+                not Vision.same_scene_position(self._settled_signature, Vision.scene_signature(image))):
             self._settled_signature = None
             raise RouteSyncLost(f"{context}场景位置发生变化，可能是延迟移动或网络回退")
 
@@ -502,8 +540,9 @@ class Runner:
             if self._wait_had_blocker:
                 self._settled_signature = None
                 raise RouteSyncLost("走位期间出现加载/网络提示，不能继续后续路线")
-            displacement = float(np.mean(cv2.absdiff(Vision.scene_signature(after), before_signature)))
-            if displacement < 4.0:
+            after_signature = Vision.scene_signature(after)
+            displacement = float(np.mean(cv2.absdiff(after_signature, before_signature)))
+            if displacement < 4.0 or Vision.same_scene_position(before_signature, after_signature):
                 self._settled_signature = None
                 raise RouteSyncLost("走位后场景未变化，移动未生效或被网络回退")
 
@@ -662,7 +701,7 @@ class Runner:
             if self._wait_had_blocker:
                 self._settled_signature = None
                 raise RouteSyncLost(f"地块 {plot_id} 等待时网络/加载中断，必须复原重走")
-            if np.mean(cv2.absdiff(Vision.scene_signature(ready), Vision.scene_signature(image))) > 2.0:
+            if not Vision.same_scene_position(Vision.scene_signature(image), Vision.scene_signature(ready)):
                 self._settled_signature = None
                 raise RouteSyncLost(f"地块 {plot_id} 等待期间位置发生变化，不能沿用原落点")
             state = self.vision.plot(ready)
