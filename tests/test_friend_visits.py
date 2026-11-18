@@ -234,10 +234,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(runner.deadline, 1285)
         self.assertEqual(limited.deadline, 700)
 
-    def test_pinned_friend_without_a_ready_badge_is_still_checked(self):
+    def test_pinned_friend_without_a_ready_badge_is_skipped(self):
         friend = self.friend()
         self.scan_pages([[friend]])
-        self.assertIs(self.runner.next_friend(), friend)
+        self.assertIsNone(self.runner.next_friend())
+        self.runner.tap.assert_not_called()
 
     def test_ready_friend_on_later_page_precedes_badgeless_friend(self):
         first = self.friend("alpha")
@@ -255,12 +256,120 @@ class RunnerTests(unittest.TestCase):
         self.scan_pages([[ready], [pending]])
         self.assertIs(self.runner.next_friend(), pending)
 
-    def test_ready_badge_may_disappear_during_fresh_row_confirmation(self):
+    def test_disappeared_ready_badge_cancels_a_scheduled_visit(self):
         before = self.friend(available=True)
         after = replace(before, available=False, y=250)
         self.scan_pages([[before]])
         self.runner.vision.friends.return_value = [after]
+        self.assertIsNone(self.runner.next_friend())
+        self.runner.tap.assert_not_called()
+
+    def test_disappeared_badge_does_not_block_the_next_ready_friend(self):
+        first = self.friend("alpha", available=True)
+        second = self.friend("bravo", available=True)
+        second.identity = np.flip(first.identity, axis=1).copy()
+        self.scan_pages([[first, second]])
+        self.runner.vision.friends.return_value = [replace(first, available=False), second]
+        self.assertIs(self.runner.next_friend(), second)
+        self.runner.tap.assert_not_called()
+
+    def test_pending_visit_survives_a_disappeared_badge_on_fresh_confirmation(self):
+        before = self.friend(available=True)
+        after = replace(before, available=False, y=250)
+        self.runner.save_progress(before, {"L1-1"})
+        self.scan_pages([[before]])
+        self.runner.vision.friends.return_value = [after]
         self.assertIs(self.runner.next_friend(), after)
+
+    def test_completed_friend_with_stale_badge_is_suppressed_after_restart(self):
+        friend = self.friend(available=True)
+        self.runner.save_progress(friend, {"L1-1"}, complete=True)
+        restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
+        self.runner.checked = restored.checked
+        self.scan_pages([[friend]])
+        self.assertIsNone(self.runner.next_friend())
+        self.assertIsNone(restored.pending_for(friend))
+        self.assertTrue(restored.recently_checked(friend))
+        self.runner.tap.assert_not_called()
+
+    def test_completed_friend_is_immediately_suppressed_before_returning_home(self):
+        friend = self.friend(available=True)
+        self.runner.move = Mock()
+        self.runner.take_plot = Mock(return_value="taken")
+        self.runner.walk(friend)
+        self.assertTrue(self.runner.report["visits"][0]["complete"])
+        self.assertFalse(self.runner.needs_visit(friend))
+        self.assertIsNone(self.runner.pending_for(friend))
+
+    def test_recent_completion_expires_and_does_not_hide_later_crops(self):
+        friend = self.friend(available=True)
+        self.runner.save_progress(friend, set(), complete=True)
+        checked = datetime.fromisoformat(self.runner.checked_at(friend))
+        for seconds, recent in ((0, True), (10, True), (20, True), (29.9, True), (30, False), (60, False)):
+            with self.subTest(seconds=seconds):
+                self.assertEqual(self.runner.recently_checked(friend, checked + timedelta(seconds=seconds)), recent)
+        self.runner.checked[0]["checked_at"] = (datetime.now(f.CHINA_TZ) - timedelta(seconds=31)).isoformat()
+        self.scan_pages([[friend]])
+        self.assertIs(self.runner.next_friend(), friend)
+
+    def test_expired_completion_without_badge_still_does_not_visit_an_empty_farm(self):
+        friend = self.friend()
+        self.runner.save_progress(friend, set(), complete=True)
+        self.runner.checked[0]["checked_at"] = (datetime.now(f.CHINA_TZ) - timedelta(hours=1)).isoformat()
+        self.scan_pages([[friend]])
+        self.assertIsNone(self.runner.next_friend())
+
+    def test_pending_visit_bypasses_a_recent_completion(self):
+        friend = self.friend()
+        self.runner.save_progress(friend, set(), complete=True)
+        self.runner.save_progress(friend, {"L1-1"})
+        self.scan_pages([[friend]])
+        self.assertIs(self.runner.next_friend(), friend)
+
+    def test_invalid_completion_timestamp_does_not_hide_a_ready_friend(self):
+        friend = self.friend(available=True)
+        self.runner.save_progress(friend, set(), complete=True)
+        self.runner.checked[0]["checked_at"] = "invalid"
+        self.assertFalse(self.runner.recently_checked(friend))
+        self.assertTrue(self.runner.needs_visit(friend))
+
+    def test_naive_completion_timestamp_uses_china_time(self):
+        friend = self.friend(available=True)
+        self.runner.save_progress(friend, set(), complete=True)
+        self.runner.checked[0]["checked_at"] = "2026-11-17T18:00:00"
+        self.assertTrue(self.runner.recently_checked(friend, datetime(2026, 11, 17, 10, 0, 10, tzinfo=timezone.utc)))
+        self.assertTrue(self.runner.recently_checked(friend, datetime(2026, 11, 17, 18, 0, 10)))
+
+    def test_visit_rechecks_badge_at_click_boundary(self):
+        before = self.friend(available=True)
+        self.runner.visible_friend = Mock(return_value=replace(before, available=False))
+        self.assertFalse(self.runner.visit(before))
+        self.runner.tap.assert_not_called()
+        self.assertEqual(self.runner.visited, [])
+
+    def test_visit_does_not_click_a_target_that_can_no_longer_be_found(self):
+        self.runner.visible_friend = Mock(return_value=None)
+        self.assertFalse(self.runner.visit(self.friend(available=True)))
+        self.runner.tap.assert_not_called()
+
+    def test_visit_rechecks_completion_cooldown_at_click_boundary(self):
+        friend = self.friend(available=True)
+        self.runner.visible_friend = Mock(return_value=friend)
+        self.runner.save_progress(friend, set(), complete=True)
+        self.assertFalse(self.runner.visit(friend))
+        self.runner.tap.assert_not_called()
+
+    def test_visit_uses_fresh_coordinates_and_allows_pending_badgeless_target(self):
+        before = self.friend(available=True)
+        after = replace(before, available=False, y=250)
+        self.runner.save_progress(before, {"L1-1"})
+        self.runner.visible_friend = Mock(return_value=after)
+        self.runner.vision.at_friend.return_value = True
+        self.runner.vision.panel_open.return_value = False
+        self.runner.wait_scene_ready = Mock()
+        self.assertTrue(self.runner.visit(before))
+        self.runner.tap.assert_called_once_with(1228, 250)
+        self.assertIs(self.runner.visited[0], after)
 
     def test_unstable_first_account_does_not_prevent_selecting_the_next_account(self):
         first = self.friend("alpha", available=True)
@@ -323,6 +432,19 @@ class RunnerTests(unittest.TestCase):
         pages = list(self.runner.scan_friends())
         self.assertEqual(len(pages), 2)
         self.assertIs(pages[0][0], friend)
+
+    def test_zero_stock_never_sends_a_take_even_if_button_is_still_lit(self):
+        self.runner.vision.plot.return_value = f.PlotState(selected=True, stock=0, button=(1073, 569))
+        self.assertEqual(self.runner.take_plot("L1-1"), "unavailable")
+        self.runner.tap.assert_not_called()
+
+    def test_zero_stock_on_button_recheck_never_sends_a_take(self):
+        self.runner.vision.plot.side_effect = [
+            f.PlotState(selected=True, stock=1),
+            f.PlotState(selected=True, stock=0, button=(1073, 569)),
+        ]
+        self.assertEqual(self.runner.take_plot("L1-1"), "unavailable")
+        self.runner.tap.assert_not_called()
 
     def test_success_requires_counter_change(self):
         before = f.PlotState(selected=True, remaining=39, stock=44, button=(1073, 569))
@@ -494,8 +616,8 @@ class RunnerTests(unittest.TestCase):
             self.runner.next_friend()
 
     def test_unchecked_accounts_precede_previously_completed_accounts_next_round(self):
-        checked = self.friend("alpha")
-        unchecked = self.friend("bravo")
+        checked = self.friend("alpha", available=True)
+        unchecked = self.friend("bravo", available=True)
         unchecked.identity = np.flip(checked.identity, axis=1).copy()
         self.runner.save_progress(checked, set(), complete=True)
         restored = f.Runner(self.host, datetime.now() + timedelta(minutes=20))
@@ -512,6 +634,16 @@ class RunnerTests(unittest.TestCase):
         restored.walk(friend)
         self.assertEqual(restored.take_plot.call_count, 24)
         self.assertNotEqual(restored.checked_at(friend), "")
+
+    def test_run_does_not_walk_when_visit_was_cancelled_at_click_boundary(self):
+        self.runner.home = Mock()
+        self.runner.next_friend = Mock(side_effect=[self.friend(available=True), None])
+        self.runner.visit = Mock(return_value=False)
+        self.runner.walk = Mock()
+        report = self.runner.run()
+        self.runner.walk.assert_not_called()
+        self.runner.home.assert_called_once_with()
+        self.assertEqual(report["visits"], [])
 
     def test_run_checks_the_next_account_after_an_isolated_unknown(self):
         first = self.friend("alpha")

@@ -24,6 +24,8 @@ SIZE = (1280, 720)
 ROOT = Path(__file__).resolve().parents[2]
 ROUTE_PATH = ROOT / "resources" / "routes" / "pinned-friends.json"
 ROUTE_SYNC_VERSION = 1
+# The game may keep a completed farm's ready badge visible for 10–20 seconds.
+READY_BADGE_SETTLE_SEC = 30
 
 
 def take_blocked_until(now=None):
@@ -428,6 +430,28 @@ class Runner:
         return next((item["checked_at"] for item in self.checked
                      if Vision.same_friend(friend, item["friend"])), "")
 
+    def recently_checked(self, friend, now=None):
+        """Suppress a stale ready badge without hiding later crops all day."""
+        try:
+            checked = datetime.fromisoformat(self.checked_at(friend))
+        except (TypeError, ValueError):
+            return False
+        if checked.tzinfo is None:
+            checked = checked.replace(tzinfo=CHINA_TZ)
+        now = now or datetime.now(CHINA_TZ)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=CHINA_TZ)
+        return 0 <= (now - checked).total_seconds() < READY_BADGE_SETTLE_SEC
+
+    def needs_visit(self, friend):
+        if not friend.pinned or any(Vision.same_friend(friend, old) for old in self.visited):
+            return False
+        # Interrupted routes still need their unresolved plots checked, even
+        # when the badge has gone. A completed route is never pending.
+        if self.pending_for(friend) is not None:
+            return True
+        return friend.available and not self.recently_checked(friend)
+
     def save_progress(self, friend, taken, *, complete=False):
         if friend is None or self.dry_run:
             return
@@ -621,48 +645,56 @@ class Runner:
         candidates = []
         for rows in self.scan_friends():
             for row in rows:
-                if (not row.pinned
-                        or any(self.vision.same_friend(row, old) for old in self.visited)
+                if (not self.needs_visit(row)
                         or any(self.vision.same_friend(row, old) for old in candidates)):
                     continue
                 candidates.append(row)
-        print(f"  好友扫描: 待检查置顶 {len(candidates)}，可拿取图标 "
+        print(f"  好友扫描: 待访问置顶 {len(candidates)}，可拿取图标 "
               f"{sum(row.available for row in candidates)}，待补查 "
               f"{sum(self.pending_for(row) is not None for row in candidates)}", flush=True)
-        # The ready badge is a scheduling hint: an absent or missed badge must
-        # not suppress a pinned account or an interrupted farm's remaining plots.
         candidates.sort(key=lambda row: (self.pending_for(row) is None, not row.available,
                                          self.checked_at(row)))
-        if not candidates:
-            return None
+        unlocated = False
         for target in candidates:
             # 少量置顶好友通常仍在当前页，重新确认后即可直接选择。
             # 只有当前页没有目标时才回顶重扫，避免上下滑一整轮。
             match = self.visible_friend(target)
-            if match is not None:
+            if match is None:
+                for rows in self.scan_friends():
+                    if not any(row.pinned and self.vision.same_friend(target, row) for row in rows):
+                        continue
+                    match = self.visible_friend(target)
+                    if match is not None:
+                        break
+            if match is None:
+                unlocated = True
+                print(f"  ⚠️ 置顶好友 {target.name or '昵称未识别'} 未能重新定位，检查其他好友", flush=True)
+                continue
+            if self.needs_visit(match):
                 return match
-            for rows in self.scan_friends():
-                if not any(row.pinned and self.vision.same_friend(target, row) for row in rows):
-                    continue
-                match = self.visible_friend(target)
-                if match is not None:
-                    return match
-            print(f"  ⚠️ 置顶好友 {target.name or '昵称未识别'} 未能重新定位，检查其他好友", flush=True)
-        raise StopVisit("置顶好友重新定位失败，保留未完成进度")
+            print(f"  跳过置顶好友 {match.name or '昵称未识别'}：可拿取状态已更新或刚检查完成", flush=True)
+        if unlocated:
+            raise StopVisit("置顶好友重新定位失败，保留未完成进度")
+        return None
 
     def visit(self, friend):
-        print(f"  拜访置顶好友: {friend.name or '昵称未识别'} "
-              f"(可拿取图标={'有' if friend.available else '无'}，"
-              f"补查={'是' if self.pending_for(friend) else '否'})", flush=True)
-        self.tap(1228, friend.y)
+        # Recheck at the actual click boundary, not just while scheduling.
+        current = self.visible_friend(friend)
+        if current is None or not self.needs_visit(current):
+            print(f"  跳过置顶好友 {friend.name or '昵称未识别'}：点击前已无可拿取目标", flush=True)
+            return False
+        print(f"  拜访置顶好友: {current.name or '昵称未识别'} "
+              f"(可拿取图标={'有' if current.available else '无'}，"
+              f"补查={'是' if self.pending_for(current) else '否'})", flush=True)
+        self.tap(1228, current.y)
         for _ in range(35):
             time.sleep(1)
             image = self.capture()
             if self.vision.at_friend(image) and not self.vision.panel_open(image):
                 self._settled_signature = None
                 self.wait_scene_ready()
-                self.visited.append(friend)
-                return
+                self.visited.append(current)
+                return True
         raise StopVisit("拜访加载超时")
 
     def remember(self, state):
@@ -719,12 +751,12 @@ class Runner:
             return "observed"
         # A previous plot's toast survives movement (recording frame 18).
         # Only this plot's crop panel can resolve an unripe stop before a tap.
-        if before.unripe:
+        if before.unripe or before.stock == 0:
             return "unavailable"
         if before.button is None:
             time.sleep(.7)
             stable = self.selected_plot_state(plot_id)
-            if stable.selected and stable.unripe:
+            if stable.selected and (stable.unripe or stable.stock == 0):
                 return "unavailable"
             if stable.selected and stable.disabled and before.disabled:
                 return "unavailable"
@@ -845,7 +877,8 @@ class Runner:
                 if friend is None:
                     self.report["status"] = "置顶好友已全部检查"
                     break
-                self.visit(friend)
+                if self.visit(friend) is False:
+                    continue
                 self.walk(friend)
                 self.home()
             else:
